@@ -46,9 +46,9 @@ public:
             }
             else if (device.type == DeviceType::CUDA) {
 #if defined(USE_CUDA)
-                cudaFree(ptr);
+                (void)cudaFree(ptr);
 #elif defined(USE_ROCM)
-                hipFree(ptr);
+                (void)hipFree(ptr);
 #endif
             }
         });
@@ -116,21 +116,21 @@ public:
 #if defined(USE_CUDA)
             GPU_CHECK(cudaMemcpy(new_storage->data(), storage_->data(), bytes, cudaMemcpyHostToDevice));
 #elif defined(USE_ROCM)
-            GPU_CHECK(hipMemcpy(new_storage->data(), storage_->data(), bytes, cudaMemcpyHostToDevice));
+            GPU_CHECK(hipMemcpy(new_storage->data(), storage_->data(), bytes, hipMemcpyHostToDevice));
 #endif
         } 
         else if (this->device().type == DeviceType::CUDA && target_device.type == DeviceType::CPU) {
 #if defined(USE_CUDA)
             GPU_CHECK(cudaMemcpy(new_storage->data(), storage_->data(), bytes, cudaMemcpyDeviceToHost));
 #elif defined(USE_ROCM)
-            GPU_CHECK(hipMemcpy(new_storage->data(), storage_->data(), bytes, cudaMemcpyDeviceToHost));
+            GPU_CHECK(hipMemcpy(new_storage->data(), storage_->data(), bytes, hipMemcpyDeviceToHost));
 #endif
         }
         else if (this->device().type == DeviceType::CUDA && target_device.type == DeviceType::CUDA) {
 #if defined(USE_CUDA)
             GPU_CHECK(cudaMemcpy(new_storage->data(), storage_->data(), bytes, cudaMemcpyDeviceToDevice));
 #elif defined(USE_ROCM)
-            GPU_CHECK(hipMemcpy(new_storage->data(), storage_->data(), bytes, cudaMemcpyDeviceToDevice));
+            GPU_CHECK(hipMemcpy(new_storage->data(), storage_->data(), bytes, hipMemcpyDeviceToDevice));
 #endif
         }
 

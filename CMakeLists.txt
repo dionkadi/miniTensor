@@ -8,7 +8,7 @@ set(CMAKE_CUDA_ARCHITECTURES 75 80)
 project(miniTensor
         VERSION 0.1
         DESCRIPTION "A simple tensor library"
-        LANGUAGES CXX CUDA HIP
+        LANGUAGES CXX
 )
 
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
@@ -55,17 +55,18 @@ endif()
 find_package(GTest REQUIRED)
 
 add_executable(tensor_tests test/tensor_test.cpp)
-set_source_files_properties(test/tensor_test.cpp PROPERTIES LANGUAGE CUDA)
 target_include_directories(tensor_tests PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 
 # Configuration based on the selected backend
 if(USE_CUDA)
     enable_language(CUDA)
     target_compile_definitions(tensor_tests PRIVATE -DUSE_CUDA)
+    set_source_files_properties(test/tensor_test.cpp PROPERTIES LANGUAGE CUDA)
     # Link CUDA libraries if needed (e.g., target_link_libraries(... CUDA::cudart))
 elseif(USE_ROCM)
     enable_language(HIP)
     target_compile_definitions(tensor_tests PRIVATE -DUSE_ROCM)
+    set_source_files_properties(test/tensor_test.cpp PROPERTIES LANGUAGE HIP)
     # Link HIP libraries if needed
 else()
     message(STATUS "No GPU backend selected. Falling back to CPU only.")
