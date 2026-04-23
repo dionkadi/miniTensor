@@ -1,0 +1,7 @@
+{
+	"InstallScripts" : 
+	[
+		"/home/tomg/Codes/Projects/miniTensor/build/cmake_install.cmake"
+	],
+	"Parallel" : false
+}

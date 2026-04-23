@@ -1,0 +1,4 @@
+/home/tomg/Codes/Projects/miniTensor/build/CMakeFiles/tensor.dir
+/home/tomg/Codes/Projects/miniTensor/build/CMakeFiles/tensor_tests.dir
+/home/tomg/Codes/Projects/miniTensor/build/CMakeFiles/edit_cache.dir
+/home/tomg/Codes/Projects/miniTensor/build/CMakeFiles/rebuild_cache.dir

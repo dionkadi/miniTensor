@@ -1,0 +1,5 @@
+# ninja log v7
+2	3682	1776917658850427084	CMakeFiles/tensor_tests.dir/test/tensor_test.cpp.o	bc3ddc1d831c4005
+3682	3727	1776917662531213549	tensor_tests	5829c773b62311c2
+2	4901	1776918293870174087	CMakeFiles/tensor_tests.dir/test/tensor_test.cpp.o	f4e78a880d41951d
+4902	4948	1776918298768897466	tensor_tests	5829c773b62311c2
