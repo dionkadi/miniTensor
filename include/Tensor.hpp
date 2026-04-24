@@ -9,7 +9,7 @@
 #include <stdexcept>
 #include <vector>
 
-#include "gpuUtils.hpp"
+#include "gpu_utils.hpp"
 
 enum class DeviceType { CPU, CUDA };
 
@@ -103,6 +103,32 @@ public:
         return Tensor(storage_, new_shape, new_strides, offset_);
     }
 
+    Self expand(const std::vector<size_t>& target_shape) const {
+        if (shape_ == target_shape) return *this;
+
+        std::vector<size_t> new_strides(target_shape.size(), 0);
+        int offset = target_shape.size() - shape_.size();
+
+        if (offset < 0) {
+            throw std::invalid_argument("Cannot expand to a smaller number of dimensions.");
+        }
+
+        for (int i = target_shape.size() - 1; i >= 0; --i) {
+            size_t current_dim = (i >= offset) ? shape_[i - offset] : 1;
+            size_t current_stride = (i >= offset) ? strides_[i - offset] : 0;
+
+            if (current_dim != target_shape[i] && current_dim != 1) {
+                throw std::invalid_argument("Incompatible shapes for broadcasting.");
+            }
+
+            // The Magic: If we are stretching a dimension of size 1 to size N,
+            // the stride becomes 0. Otherwise, keep the original stride.
+            new_strides[i] = (current_dim == target_shape[i]) ? current_stride : 0;
+        }
+
+        return Tensor(storage_, target_shape, new_strides, offset_);
+    }
+
     Self to(Device target_device) const {
         if (this->device() == target_device) {
             return *this;
@@ -140,6 +166,20 @@ public:
     const std::vector<size_t>& shape() const noexcept { return shape_; }
     const std::vector<size_t>& strides() const noexcept { return strides_; }
     Device device() const noexcept { return storage_->device(); }
+    T* data() noexcept { return storage_->data(); }
+    const T* data() const noexcept { return storage_->data(); }
+    size_t total_elements() const noexcept {
+        return std::accumulate(shape_.begin(), shape_.end(), 1UL, std::multiplies<size_t>{});
+    }
+    size_t offset() const noexcept { return offset_; }
+    bool is_contiguous() const noexcept {
+        size_t expected_stride = 1;
+        for (int i = shape_.size() - 1; i >= 0; --i) {
+            if (strides_[i] != expected_stride) return false;
+            expected_stride *= shape_[i];
+        }
+        return true;
+    }
 
 private:
     Tensor(std::shared_ptr<TensorStorage<T>> storage, std::vector<size_t> shape, std::vector<size_t> strides, size_t offset) 

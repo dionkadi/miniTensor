@@ -45,11 +45,12 @@ if(USE_CUDA AND USE_ROCM)
     message(FATAL_ERROR "Cannot enable both CUDA and ROCm simultaneously.")
 endif()
 
-add_library(tensor INTERFACE "include/Tensor.hpp")
+add_library(tensor "src/gpu_ops.cpp")
+target_include_directories(tensor PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 if(USE_CUDA)
-    target_include_directories(tensor INTERFACE "/opt/cuda/include")
+    target_include_directories(tensor PUBLIC "/opt/cuda/include")
 elseif(USE_ROCM)
-    target_include_directories(tensor INTERFACE "/opt/rocm/include")
+    target_include_directories(tensor PUBLIC "/opt/rocm/include")
 endif()
 
 find_package(GTest REQUIRED)
@@ -60,14 +61,20 @@ target_include_directories(tensor_tests PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/inclu
 # Configuration based on the selected backend
 if(USE_CUDA)
     enable_language(CUDA)
-    target_compile_definitions(tensor_tests PRIVATE -DUSE_CUDA)
-    set_source_files_properties(test/tensor_test.cpp PROPERTIES LANGUAGE CUDA)
-    # Link CUDA libraries if needed (e.g., target_link_libraries(... CUDA::cudart))
+    target_compile_definitions(tensor PUBLIC -DUSE_CUDA)
+    set_source_files_properties(
+        src/gpu_ops.cpp 
+        test/tensor_test.cpp 
+        PROPERTIES LANGUAGE CUDA
+    )
 elseif(USE_ROCM)
     enable_language(HIP)
-    target_compile_definitions(tensor_tests PRIVATE -DUSE_ROCM)
-    set_source_files_properties(test/tensor_test.cpp PROPERTIES LANGUAGE HIP)
-    # Link HIP libraries if needed
+    target_compile_definitions(tensor PUBLIC -DUSE_ROCM)
+    set_source_files_properties(
+        src/gpu_ops.cpp 
+        test/tensor_test.cpp 
+        PROPERTIES LANGUAGE HIP
+    )
 else()
     message(STATUS "No GPU backend selected. Falling back to CPU only.")
 endif()
