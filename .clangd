@@ -1,0 +1,5 @@
+CompileFlags:
+  Add: 
+    - "--rocm-path=/opt/rocm"
+    - "-I/opt/rocm/include"
+    - "-D__HIP_PLATFORM_AMD__=1"

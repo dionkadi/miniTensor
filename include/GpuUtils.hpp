@@ -36,6 +36,5 @@ using GpuStream_t = cudaStream_t;
 using GpuStream_t = hipStream_t;
 
 #else
-    // Define empty or stub structures if compiling CPU-only
     #define GPU_CHECK(call) 
 #endif

@@ -4,6 +4,7 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_CUDA_ARCHITECTURES 75 80)
+set(CMAKE_HIP_ARCHITECTURES "gfx1102;gfx1103")
 
 project(miniTensor
         VERSION 0.1
@@ -45,7 +46,9 @@ if(USE_CUDA AND USE_ROCM)
     message(FATAL_ERROR "Cannot enable both CUDA and ROCm simultaneously.")
 endif()
 
-add_library(tensor "src/gpu_ops.cpp")
+add_library(tensor 
+    src/gpu_ops.cpp
+)
 target_include_directories(tensor PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 if(USE_CUDA)
     target_include_directories(tensor PUBLIC "/opt/cuda/include")
@@ -69,7 +72,7 @@ if(USE_CUDA)
     )
 elseif(USE_ROCM)
     enable_language(HIP)
-    target_compile_definitions(tensor PUBLIC -DUSE_ROCM)
+    target_compile_definitions(tensor PUBLIC -DUSE_ROCM -D__HIP_PLATFORM_AMD__)
     set_source_files_properties(
         src/gpu_ops.cpp 
         test/tensor_test.cpp 

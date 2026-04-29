@@ -1,0 +1,10 @@
+{
+    "cmake.configureArgs": [
+        "-DUSE_ROCM=ON"
+    ],
+    "clangd.arguments": [
+        "--compile-commands-dir=${workspaceFolder}/build",
+        "--background-index",
+        "--clang-tidy"
+    ]
+}

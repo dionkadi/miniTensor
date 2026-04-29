@@ -1,6 +1,6 @@
 #include <gtest/gtest.h>
 #include "Tensor.hpp"
-#include "Dispatcher.hpp"
+#include "TensorOps.hpp"
 
 // Test 1: Verify CPU Tensor initialization and stride calculation
 TEST(TensorTest, CpuStridesAndMemory) {
@@ -313,4 +313,199 @@ TEST(DispatchTest, GpuMatmul) {
     EXPECT_FLOAT_EQ(C.data()[1], 64.0f);  // 1*8 + 2*10 + 3*12
     EXPECT_FLOAT_EQ(C.data()[2], 139.0f); // 4*7 + 5*9 + 6*11
     EXPECT_FLOAT_EQ(C.data()[3], 154.0f); // 4*8 + 5*10 + 6*12
+}
+
+// ==========================================
+// ====== AUTOGRAD ENGINE TESTS =============
+// ==========================================
+
+TEST(AutogradTest, BasicAddition) {
+    Tensor<float> A({2});
+    Tensor<float> B({2});
+    
+    A.data()[0] = 1.0f; A.data()[1] = 2.0f;
+    B.data()[0] = 3.0f; B.data()[1] = 4.0f;
+    
+    A.set_requires_grad(true);
+    B.set_requires_grad(true);
+
+    Tensor<float> C = A + B;
+    
+    // C requires grad because A and B do
+    EXPECT_TRUE(C.requires_grad());
+    EXPECT_NE(C.grad_fn(), nullptr);
+
+    // Compute gradients (implicitly seeds dC = [1, 1])
+    C.backward();
+
+    // dC/dA = 1, so A.grad should be [1, 1]
+    EXPECT_FALSE(A.grad().empty());
+    EXPECT_FLOAT_EQ(A.grad().data()[0], 1.0f);
+    EXPECT_FLOAT_EQ(A.grad().data()[1], 1.0f);
+
+    // dC/dB = 1, so B.grad should be [1, 1]
+    EXPECT_FALSE(B.grad().empty());
+    EXPECT_FLOAT_EQ(B.grad().data()[0], 1.0f);
+    EXPECT_FLOAT_EQ(B.grad().data()[1], 1.0f);
+}
+
+TEST(AutogradTest, GradientAccumulation) {
+    Tensor<float> A({2});
+    A.data()[0] = 3.0f; A.data()[1] = 5.0f;
+    A.set_requires_grad(true);
+
+    // C = A + A
+    // Graph: AddBackward -> connects to A twice!
+    Tensor<float> C = A + A;
+    C.backward();
+
+    // Since A is used twice, its gradient should accumulate to 2.
+    // dC/dA = d(A+A)/dA = 2
+    EXPECT_FLOAT_EQ(A.grad().data()[0], 2.0f);
+    EXPECT_FLOAT_EQ(A.grad().data()[1], 2.0f);
+}
+
+TEST(AutogradTest, Matmul) {
+    Tensor<float> A({2, 3}); 
+    Tensor<float> B({3, 2}); 
+
+    // A = [[1, 2, 3],
+    //      [4, 5, 6]]
+    A.data()[0] = 1; A.data()[1] = 2; A.data()[2] = 3;
+    A.data()[3] = 4; A.data()[4] = 5; A.data()[5] = 6;
+
+    // B = [[7, 8],
+    //      [9, 10],
+    //      [11, 12]]
+    B.data()[0] = 7;  B.data()[1] = 8;
+    B.data()[2] = 9;  B.data()[3] = 10;
+    B.data()[4] = 11; B.data()[5] = 12;
+
+    A.set_requires_grad(true);
+    B.set_requires_grad(true);
+
+    Tensor<float> C = matmul(A, B); // 2x2
+    C.backward();
+
+    // Expected dC (grad_output) is implicitly a 2x2 matrix of 1s:
+    // [[1, 1],
+    //  [1, 1]]
+
+    // dL/dA = grad_output @ B^T
+    // [[1, 1],  @  [[ 7,  9, 11],
+    //  [1, 1]]      [ 8, 10, 12]] 
+    // Result: [[15, 19, 23],
+    //          [15, 19, 23]]
+    EXPECT_FLOAT_EQ(A.grad().data()[0], 15.0f);
+    EXPECT_FLOAT_EQ(A.grad().data()[1], 19.0f);
+    EXPECT_FLOAT_EQ(A.grad().data()[2], 23.0f);
+    EXPECT_FLOAT_EQ(A.grad().data()[3], 15.0f);
+    EXPECT_FLOAT_EQ(A.grad().data()[4], 19.0f);
+    EXPECT_FLOAT_EQ(A.grad().data()[5], 23.0f);
+
+    // dL/dB = A^T @ grad_output
+    // [[1, 4],  @  [[1, 1],
+    //  [2, 5],      [1, 1]]
+    //  [3, 6]]
+    // Result: [[5, 5],
+    //          [7, 7],
+    //          [9, 9]]
+    EXPECT_FLOAT_EQ(B.grad().data()[0], 5.0f);
+    EXPECT_FLOAT_EQ(B.grad().data()[1], 5.0f);
+    EXPECT_FLOAT_EQ(B.grad().data()[2], 7.0f);
+    EXPECT_FLOAT_EQ(B.grad().data()[3], 7.0f);
+    EXPECT_FLOAT_EQ(B.grad().data()[4], 9.0f);
+    EXPECT_FLOAT_EQ(B.grad().data()[5], 9.0f);
+}
+
+TEST(AutogradTest, BroadcastingAddition) {
+    Tensor<float> A({2, 3}); 
+    Tensor<float> B({3}); 
+
+    A.fill(1.0f);
+    B.fill(2.0f);
+    
+    A.set_requires_grad(true);
+    B.set_requires_grad(true);
+
+    // B is broadcasted across the rows of A
+    Tensor<float> C = A + B;
+    C.backward();
+
+    // Grad of C is 2x3 matrix of ones.
+    // unbroadcast for A (which was 2x3) should result in 2x3 ones.
+    EXPECT_FLOAT_EQ(A.grad().data()[0], 1.0f);
+    EXPECT_FLOAT_EQ(A.grad().data()[5], 1.0f);
+
+    // unbroadcast for B (which was 1D of size 3) should sum over axis 0.
+    // The sum of [[1, 1, 1], [1, 1, 1]] across axis 0 is [2, 2, 2].
+    EXPECT_EQ(B.grad().shape()[0], 3);
+    EXPECT_FLOAT_EQ(B.grad().data()[0], 2.0f);
+    EXPECT_FLOAT_EQ(B.grad().data()[1], 2.0f);
+    EXPECT_FLOAT_EQ(B.grad().data()[2], 2.0f);
+}
+
+TEST(AutogradTest, ChainedOperations) {
+    Tensor<float> A({2, 3}); 
+    Tensor<float> B({3, 2}); 
+    Tensor<float> C({2}); // Broadcastable bias
+
+    A.data()[0] = 1; A.data()[1] = 2; A.data()[2] = 3;
+    A.data()[3] = 4; A.data()[4] = 5; A.data()[5] = 6;
+
+    B.data()[0] = 7;  B.data()[1] = 8;
+    B.data()[2] = 9;  B.data()[3] = 10;
+    B.data()[4] = 11; B.data()[5] = 12;
+
+    C.data()[0] = 10; C.data()[1] = 20;
+
+    A.set_requires_grad(true);
+    B.set_requires_grad(true);
+    C.set_requires_grad(true);
+
+    // D = (A @ B) + C
+    Tensor<float> M = matmul(A, B);
+    Tensor<float> D = M + C;
+    
+    D.backward();
+
+    // Because the derivative of Addition is 1, `M` receives a grad of ones(2, 2).
+    // The grads for A and B should match the exact results from the pure Matmul test!
+    EXPECT_FLOAT_EQ(A.grad().data()[0], 15.0f);
+    EXPECT_FLOAT_EQ(A.grad().data()[1], 19.0f);
+    EXPECT_FLOAT_EQ(A.grad().data()[2], 23.0f);
+
+    EXPECT_FLOAT_EQ(B.grad().data()[0], 5.0f);
+    EXPECT_FLOAT_EQ(B.grad().data()[2], 7.0f);
+    EXPECT_FLOAT_EQ(B.grad().data()[4], 9.0f);
+
+    // C is a vector of size [2] added to a matrix of [2, 2].
+    // Since it behaves as row-wise broadcasting, its unbroadcast logic 
+    // will sum over the leading dimension (axis 0).
+    // ones(2, 2) summed over axis 0 -> [2, 2]
+    EXPECT_FLOAT_EQ(C.grad().data()[0], 2.0f);
+    EXPECT_FLOAT_EQ(C.grad().data()[1], 2.0f);
+}
+
+TEST(AutogradTest, GPUGradients) {
+    Device gpu_dev(DeviceType::CUDA, 0);
+
+    Tensor<float> A({2, 3}, gpu_dev); 
+    Tensor<float> B({3, 2}, gpu_dev); 
+    
+    A.fill(2.0f);
+    B.fill(3.0f);
+
+    A.set_requires_grad(true);
+    B.set_requires_grad(true);
+
+    Tensor<float> C = matmul(A, B);
+    C.backward();
+
+    // Verify gradients on the CPU side
+    Tensor<float> grad_A_cpu = A.grad().to(Device(DeviceType::CPU));
+    EXPECT_FLOAT_EQ(grad_A_cpu.data()[0], 6.0f); // [[1,1], [1,1]] @ [[3,3,3], [3,3,3]]^T = 6
+
+    Tensor<float> grad_B_cpu = B.grad().to(Device(DeviceType::CPU));
+    EXPECT_FLOAT_EQ(grad_B_cpu.data()[0], 4.0f); // [[2,2,2], [2,2,2]]^T @ [[1,1], [1,1]] = 4
 }

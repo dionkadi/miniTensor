@@ -1,6 +1,6 @@
-#include "gpu_ops.hpp"
-#include "gpu_utils.hpp"
-#include "TensorInfo.hpp"
+#include "TensorOps.hpp"
+#include "GpuUtils.hpp"
+#include "TensorImpl.hpp"
 #include <cstddef>
 
 template<typename T>
@@ -183,3 +183,99 @@ void matmul_gpu_strided(const Tensor<T>& A, const Tensor<T>& B, Tensor<T>& C) {
 
 template void matmul_gpu<float>(const Tensor<float>& A, const Tensor<float>& B, Tensor<float>& C);
 template void matmul_gpu_strided<float>(const Tensor<float>& A, const Tensor<float>& B, Tensor<float>& C);
+
+template<typename T>
+__global__ void sum_kernel(
+    const T *in, T *out,
+    size_t total_elements,
+    TensorInfo in_info,
+    TensorInfo out_info,
+    size_t reduce_axis,
+    bool keepdims,
+    size_t offset_in, 
+    size_t offset_out
+) {
+    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (idx < total_elements) {
+        size_t temp_idx = idx;
+        size_t in_phys_offset = 0;
+        size_t out_phys_offset = 0;
+
+        // Map linear index back to N-dimensional coordinates
+        for (int d = in_info.ndims - 1; d >= 0; --d) {
+            size_t coord = temp_idx % in_info.shape[d];
+            temp_idx /= in_info.shape[d];
+
+            in_phys_offset += coord * in_info.strides[d];
+
+            // Determine where this coordinate falls in the output tensor
+            if (d == reduce_axis) {
+                // We are reducing along this axis, so it maps to index 0 in the output
+                if (keepdims) {
+                    // The dimension still exists (size 1), so its stride is used but coord is 0
+                    out_phys_offset += 0 * out_info.strides[d];
+                }
+                // If not keepdims, this dimension doesn't exist in the output, so we add nothing.
+            } else {
+                // Find the corresponding dimension in the output tensor
+                int out_d = keepdims ? d : (d > reduce_axis ? d - 1 : d);
+                out_phys_offset += coord * out_info.strides[out_d];
+            }
+        }
+
+        atomicAdd(&out[offset_out + out_phys_offset], in[offset_in + in_phys_offset]);
+    }
+}
+
+template<typename T>
+Tensor<T> sum_gpu(const Tensor<T>& input, size_t axis, bool keepdims) {
+    const auto& in_shape = input.shape();
+    
+    if (axis >= in_shape.size()) {
+        throw std::invalid_argument("Reduction axis is out of bounds.");
+    }
+
+    std::vector<size_t> out_shape = in_shape;
+    if (keepdims) {
+        out_shape[axis] = 1;
+    } else {
+        out_shape.erase(out_shape.begin() + axis);
+    }
+
+    Tensor<T> output(out_shape, input.device());
+
+    size_t bytes = output.total_elements() * sizeof(T);
+#if defined(USE_CUDA)
+    GPU_CHECK(cudaMemset(output.data(), 0, bytes));
+#elif defined(USE_ROCM)
+    GPU_CHECK(hipMemset(output.data(), 0, bytes));
+#endif
+
+    size_t total_elements = input.total_elements();
+    size_t threads = 256;
+    size_t blocks = (total_elements + threads - 1) / threads;
+
+    TensorInfo in_info(input.shape(), input.strides());
+    TensorInfo out_info(output.shape(), output.strides());
+
+    sum_kernel<<<blocks, threads>>>(
+        input.data(), output.data(),
+        total_elements,
+        in_info, out_info,
+        axis, keepdims,
+        input.offset(), output.offset()
+    );
+
+#if defined(USE_CUDA)
+    GPU_CHECK(cudaGetLastError());
+    GPU_CHECK(cudaDeviceSynchronize());
+#elif defined(USE_ROCM)
+    GPU_CHECK(hipGetLastError());
+    GPU_CHECK(hipDeviceSynchronize());
+#endif
+
+    return output;
+}
+
+template Tensor<float> sum_gpu<float>(const Tensor<float>&, size_t, bool);

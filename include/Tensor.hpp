@@ -1,205 +1,114 @@
 #pragma once
 
 #include <cstddef>
-#include <cstdint>
 #include <functional>
-#include <initializer_list>
 #include <memory>
 #include <numeric>
-#include <stdexcept>
 #include <vector>
+#include <unordered_set>
 
-#include "gpu_utils.hpp"
-
-enum class DeviceType { CPU, CUDA };
-
-struct Device {
-    DeviceType type;
-    uint8_t index;
-
-    Device(DeviceType t, uint8_t i = 0): type(t), index(i) {}
-
-    bool operator==(const Device& other) const {
-        return type == other.type && index == other.index;
-    }
-};
-
-template<typename T>
-class TensorStorage {
-public:
-    explicit TensorStorage(size_t size, Device device): size_(size), device_(device) {
-        T *raw = nullptr;
-        if (device_.type == DeviceType::CPU) {
-            raw = new T[size]();
-        }
-        else if (device_.type == DeviceType::CUDA) {
-#if defined(USE_CUDA)
-            GPU_CHECK(cudaMalloc((void**)&raw, size * sizeof(T)));
-#elif defined(USE_ROCM)
-            GPU_CHECK(hipMalloc((void**)&raw, size * sizeof(T)));
-#endif
-        }
-
-        data_ = std::shared_ptr<T>(raw, [device] (T *ptr) {
-            if (device.type == DeviceType::CPU) {
-                delete [] ptr;
-            }
-            else if (device.type == DeviceType::CUDA) {
-#if defined(USE_CUDA)
-                (void)cudaFree(ptr);
-#elif defined(USE_ROCM)
-                (void)hipFree(ptr);
-#endif
-            }
-        });
-    }
-    TensorStorage(std::initializer_list<T> init): data_(init) {}
-
-    TensorStorage(const TensorStorage&) = delete;
-    TensorStorage& operator=(const TensorStorage&) = delete;
-
-    T* data() const noexcept { return data_.get(); }
-    Device device() const noexcept { return device_; }
-    size_t size() const noexcept { return size_; }
-
-private:
-    std::shared_ptr<T> data_;
-    size_t size_;
-    Device device_;
-};
+#include "TensorImpl.hpp"
 
 template<typename T>
 class Tensor {
 public:
     using Self = Tensor<T>;
 
-    Tensor(std::vector<size_t> shape, Device device = {DeviceType::CPU})
-        : shape_(std::move(shape))
-        , offset_(0)
-    {
-        size_t total_elements = std::accumulate(shape_.begin(), shape_.end(), 1UL, std::multiplies<size_t>{});
-        storage_ = std::make_shared<TensorStorage<T>>(total_elements, device);
-        compute_strides();
+    Tensor() : impl_(nullptr) {}
+
+    Tensor(std::vector<size_t> shape, Device device = {DeviceType::CPU}) {
+        size_t total_elements = std::accumulate(shape.begin(), shape.end(), 1UL, std::multiplies<size_t>{});
+        auto storage = std::make_shared<TensorStorage<T>>(total_elements, device);
+        auto strides = compute_strides(shape);
+        impl_ = std::make_shared<TensorImpl<T>>(storage, shape, strides, 0);
     }
 
-    T& at(const std::vector<size_t>& indices) {
-        size_t index = offset_;
-        for (size_t i = 0; i < indices.size(); ++i) {
-            index += indices[i] * strides_[i];
-        }
-        if (index >= storage_->size()) {
-            throw std::out_of_range("Index out of range");
-        }
-        return storage_->data()[index];
+    Tensor(std::shared_ptr<TensorImpl<T>> impl) : impl_(std::move(impl)) {}
+
+    static Self ones_like(const std::vector<size_t>& shape, const Device& device = {DeviceType::CPU}) {
+        auto tensor = Tensor<T>(shape, device);
+        tensor.fill(1U);
+        return tensor;
     }
 
-    Self transpose(size_t dim0, size_t dim1) const {
-        std::vector<size_t> new_shape = shape_;
-        std::vector<size_t> new_strides = strides_;
+    T& at(const std::vector<size_t>& indices) { return impl_->at(indices); }
+    Self transpose(size_t dim0, size_t dim1) const { return impl_->transpose(dim0, dim1); }
+    Self expand(const std::vector<size_t>& target_shape) const { return impl_->expand(target_shape); }
+    Self to(Device target_device) const { return impl_->to(target_device); }
 
-        std::swap(new_shape[dim0], new_shape[dim1]);
-        std::swap(new_strides[dim0], new_strides[dim1]);
+    bool empty() const noexcept { return impl_ == nullptr || impl_->shape_.empty(); }
+    const std::vector<size_t>& shape() const noexcept { return impl_->shape_; }
+    const std::vector<size_t>& strides() const noexcept { return impl_->strides_; }
+    Device device() const noexcept { return impl_->storage_->device(); }
+    T* data() noexcept { return impl_->storage_->data(); }
+    const T* data() const noexcept { return impl_->storage_->data(); }
+    size_t total_elements() const noexcept { return impl_->total_elements(); }
+    size_t offset() const noexcept { return impl_->offset_; }
+    bool is_contiguous() const noexcept { return impl_->is_contiguous(); }
+    void fill(const T& v) { impl_->storage_->fill(v); }
 
-        return Tensor(storage_, new_shape, new_strides, offset_);
+    bool requires_grad() const noexcept { return impl_->requires_grad_; }
+    void set_requires_grad(bool req) noexcept { impl_->requires_grad_ = req; }
+    const Self& grad() const { return impl_->grad_; }
+    void accumulate_grad(const Self& gradient) {
+        if (impl_->grad_.empty()) {
+            impl_->grad_ = gradient;
+        } else {
+            impl_->grad_ = impl_->grad_ + gradient;
+        }
     }
+    std::shared_ptr<AutogradNode<T>> grad_fn() const noexcept { return impl_->grad_fn_; }
+    void set_grad_fn(std::shared_ptr<AutogradNode<T>> fn) { impl_->grad_fn_ = fn; }
 
-    Self expand(const std::vector<size_t>& target_shape) const {
-        if (shape_ == target_shape) return *this;
-
-        std::vector<size_t> new_strides(target_shape.size(), 0);
-        int offset = target_shape.size() - shape_.size();
-
-        if (offset < 0) {
-            throw std::invalid_argument("Cannot expand to a smaller number of dimensions.");
+    void backward() {
+        if (!requires_grad()) {
+            throw std::runtime_error("Called backward on a tensor that does not require gradients.");
         }
 
-        for (int i = target_shape.size() - 1; i >= 0; --i) {
-            size_t current_dim = (i >= offset) ? shape_[i - offset] : 1;
-            size_t current_stride = (i >= offset) ? strides_[i - offset] : 0;
+        if (grad().empty()) {
+            impl_->grad_ = Tensor<T>::ones_like(shape(), device());
+        }
 
-            if (current_dim != target_shape[i] && current_dim != 1) {
-                throw std::invalid_argument("Incompatible shapes for broadcasting.");
+        std::vector<Tensor<T>> topo_order;
+        std::unordered_set<TensorImpl<T>*> visited;
+
+        std::function<void(Tensor<T>)> build_topo = [&](Tensor<T> t) {
+            if (t.empty()) return;
+            
+            TensorImpl<T>* id = t.impl_.get(); 
+            
+            if (visited.count(id)) return;
+            visited.insert(id);
+
+            if (t.grad_fn()) {
+                for (const auto& child : t.grad_fn()->get_inputs()) {
+                    build_topo(child);
+                }
             }
+            topo_order.push_back(t);
+        };
 
-            // The Magic: If we are stretching a dimension of size 1 to size N,
-            // the stride becomes 0. Otherwise, keep the original stride.
-            new_strides[i] = (current_dim == target_shape[i]) ? current_stride : 0;
+        build_topo(*this);
+
+        for (auto it = topo_order.rbegin(); it != topo_order.rend(); ++it) {
+            if (it->grad_fn()) {
+                // The gradient for *this* tensor was accumulated in previous iterations.
+                // We pass it to apply() to distribute to its inputs.
+                it->grad_fn()->apply(it->grad());
+            }
         }
-
-        return Tensor(storage_, target_shape, new_strides, offset_);
-    }
-
-    Self to(Device target_device) const {
-        if (this->device() == target_device) {
-            return *this;
-        }
-
-        size_t total_elements = storage_->size();
-        auto new_storage = std::make_shared<TensorStorage<T>>(total_elements, target_device);
-
-        size_t bytes = total_elements * sizeof(T);
-        if (this->device().type == DeviceType::CPU && target_device.type == DeviceType::CUDA) {
-#if defined(USE_CUDA)
-            GPU_CHECK(cudaMemcpy(new_storage->data(), storage_->data(), bytes, cudaMemcpyHostToDevice));
-#elif defined(USE_ROCM)
-            GPU_CHECK(hipMemcpy(new_storage->data(), storage_->data(), bytes, hipMemcpyHostToDevice));
-#endif
-        } 
-        else if (this->device().type == DeviceType::CUDA && target_device.type == DeviceType::CPU) {
-#if defined(USE_CUDA)
-            GPU_CHECK(cudaMemcpy(new_storage->data(), storage_->data(), bytes, cudaMemcpyDeviceToHost));
-#elif defined(USE_ROCM)
-            GPU_CHECK(hipMemcpy(new_storage->data(), storage_->data(), bytes, hipMemcpyDeviceToHost));
-#endif
-        }
-        else if (this->device().type == DeviceType::CUDA && target_device.type == DeviceType::CUDA) {
-#if defined(USE_CUDA)
-            GPU_CHECK(cudaMemcpy(new_storage->data(), storage_->data(), bytes, cudaMemcpyDeviceToDevice));
-#elif defined(USE_ROCM)
-            GPU_CHECK(hipMemcpy(new_storage->data(), storage_->data(), bytes, hipMemcpyDeviceToDevice));
-#endif
-        }
-
-        return Self(new_storage, shape_, strides_, offset_);
-    }
-
-    const std::vector<size_t>& shape() const noexcept { return shape_; }
-    const std::vector<size_t>& strides() const noexcept { return strides_; }
-    Device device() const noexcept { return storage_->device(); }
-    T* data() noexcept { return storage_->data(); }
-    const T* data() const noexcept { return storage_->data(); }
-    size_t total_elements() const noexcept {
-        return std::accumulate(shape_.begin(), shape_.end(), 1UL, std::multiplies<size_t>{});
-    }
-    size_t offset() const noexcept { return offset_; }
-    bool is_contiguous() const noexcept {
-        size_t expected_stride = 1;
-        for (int i = shape_.size() - 1; i >= 0; --i) {
-            if (strides_[i] != expected_stride) return false;
-            expected_stride *= shape_[i];
-        }
-        return true;
     }
 
 private:
-    Tensor(std::shared_ptr<TensorStorage<T>> storage, std::vector<size_t> shape, std::vector<size_t> strides, size_t offset) 
-        : storage_(std::move(storage))
-        , shape_(std::move(shape))
-        , strides_(std::move(strides))
-        , offset_(offset)
-    {}
-
-    void compute_strides() {
-        strides_.resize(shape_.size());
+    std::vector<size_t> compute_strides(const std::vector<size_t>& shape) {
+        std::vector<size_t> strides(shape.size());
         size_t current_stride = 1;
-        for (int i = shape_.size() - 1; i >= 0; --i) {
-            strides_[i] = current_stride;
-            current_stride *= shape_[i];
+        for (int i = shape.size() - 1; i >= 0; --i) {
+            strides[i] = current_stride;
+            current_stride *= shape[i];
         }
+        return strides;
     }
 
-    std::shared_ptr<TensorStorage<T>> storage_;
-    std::vector<size_t> shape_;
-    std::vector<size_t> strides_;
-    size_t offset_;  // starting point in storage
+    std::shared_ptr<TensorImpl<T>> impl_;
 };
