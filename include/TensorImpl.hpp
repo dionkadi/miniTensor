@@ -16,7 +16,7 @@ template<typename T> struct AutogradNode;
 template<typename T>
 class TensorStorage {
 public:
-    explicit TensorStorage(size_t size, Device device): size_(size), device_(device) {
+    explicit TensorStorage(size_t size, Device device): size_(size), device_(device), version_(0U) {
         T *raw = nullptr;
         if (device_.type == DeviceType::CPU) {
             raw = new T[size]();
@@ -70,10 +70,14 @@ public:
         }
     }
 
+    uint32_t version() const noexcept { return version_; }
+    void bump_version() noexcept { version_++; }
+
 private:
     std::shared_ptr<T> data_;
     size_t size_;
     Device device_;
+    uint32_t version_;
 };
 
 // #############################
@@ -222,6 +226,22 @@ struct TensorImpl {
         return Tensor(std::make_shared<Self>(storage_, target_shape, new_strides, offset_));
     }
 
+    Tensor<T> reshape(const std::vector<size_t>& new_shape) const {
+        size_t new_size = std::accumulate(new_shape.begin(), new_shape.end(), 1UL, std::multiplies<size_t>{});
+        if (new_size != total_elements()) {
+            throw std::invalid_argument("reshape: total element count mismatch");
+        }
+
+        std::vector<size_t> new_strides(new_shape.size());
+        size_t stride = 1;
+        for (int i = new_shape.size() - 1; i >= 0; --i) {
+            new_strides[i] = stride;
+            stride *= new_shape[i];
+        }
+
+        return Tensor<T>(std::make_shared<Self>(storage_, new_shape, new_strides, offset_));
+    }
+
     Tensor<T> to(Device target_device) const {
         if (this->device() == target_device) {
             return Tensor<T>(std::make_shared<Self>(storage_, shape_, strides_, offset_));
@@ -264,4 +284,8 @@ struct TensorImpl {
         }
         return true;
     }
+
+    uint32_t version() const noexcept { return storage_->version(); }
+    void bump_version() noexcept { storage_->bump_version(); }
+    bool is_leaf() const noexcept { return grad_fn_ == nullptr; }
 };

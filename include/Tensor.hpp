@@ -34,6 +34,7 @@ public:
     T& at(const std::vector<size_t>& indices) { return impl_->at(indices); }
     Self transpose(size_t dim0, size_t dim1) const { return impl_->transpose(dim0, dim1); }
     Self expand(const std::vector<size_t>& target_shape) const { return impl_->expand(target_shape); }
+    Self reshape(const std::vector<size_t>& new_shape) const { return impl_->reshape(new_shape); }
     Self to(Device target_device) const { return impl_->to(target_device); }
 
     bool empty() const noexcept { return impl_ == nullptr || impl_->shape_.empty(); }
@@ -46,6 +47,11 @@ public:
     size_t offset() const noexcept { return impl_->offset_; }
     bool is_contiguous() const noexcept { return impl_->is_contiguous(); }
     void fill(const T& v) { impl_->storage_->fill(v); }
+    void zero_grad() {
+        if (!impl_->grad_.empty()) {
+            impl_->grad_.fill(T(0)); 
+        }
+    }
 
     bool requires_grad() const noexcept { return impl_->requires_grad_; }
     void set_requires_grad(bool req) noexcept { impl_->requires_grad_ = req; }
@@ -98,6 +104,10 @@ public:
             }
         }
     }
+
+    uint32_t version() const { return impl_ ? impl_->version() : 0; }
+    void bump_version() { if (impl_) impl_->bump_version(); }
+    bool is_leaf() const { return impl_ ? impl_->is_leaf() : true; }
 
 private:
     std::vector<size_t> compute_strides(const std::vector<size_t>& shape) {

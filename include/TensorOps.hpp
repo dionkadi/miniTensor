@@ -1,51 +1,102 @@
 #pragma once
 
 #include "Autograd.hpp"
+#include <cstddef>
 
-// #############################
-// #   CPU operations
-// #############################
-template<typename T>
-void add_cpu(const Tensor<T>& A, const Tensor<T>& B, Tensor<T>& C) {
+// Macro to seamlessly compile functors for both Host (CPU) and Device (GPU)
+#ifndef HD_INLINE
+#if defined(__CUDACC__) || defined(__HIPCC__) || defined(__HIP__) || defined(__NVCC__)
+#define HD_INLINE __host__ __device__ inline
+#else
+#define HD_INLINE inline
+#endif
+#endif
+
+// #######################################################
+// #   Functors
+// #######################################################
+template<typename T> struct AddOp { HD_INLINE T operator()(T a, T b) const { return a + b; } };
+template<typename T> struct SubOp { HD_INLINE T operator()(T a, T b) const { return a - b; } };
+template<typename T> struct MulOp { HD_INLINE T operator()(T a, T b) const { return a * b; } };
+template<typename T> struct Pow2Op { HD_INLINE T operator()(T a) const { return a * a; } };
+template<typename T> struct MulScalarOp { 
+    T scalar;
+    HD_INLINE MulScalarOp(T s) : scalar(s) {}
+    HD_INLINE T operator()(T a) const { return a * scalar; } 
+};
+
+// #######################################################
+// #   Generic CPU Execution Engine
+// #######################################################
+template<typename T, typename Op>
+void binary_cpu(const Tensor<T>& A, const Tensor<T>& B, Tensor<T>& C, Op op) {
     const T* a_ptr = A.data();
     const T* b_ptr = B.data();
     T* c_ptr = C.data();
-
-    // Standard optimized CPU loop (could use OpenMP here later)
     for (size_t i = 0; i < A.total_elements(); ++i) {
-        c_ptr[i] = a_ptr[i] + b_ptr[i];
+        c_ptr[i] = op(a_ptr[i], b_ptr[i]);
     }
 }
 
-template<typename T>
-void add_cpu_strided(const Tensor<T>& A, const Tensor<T>& B, Tensor<T>& C) {
-    const T *A_ptr = A.data() + A.offset();
-    const T *B_ptr = B.data() + B.offset();
-    T *C_ptr = C.data() + C.offset();
+template<typename T, typename Op>
+void binary_cpu_strided(const Tensor<T>& A, const Tensor<T>& B, Tensor<T>& C, Op op) {
+    const T *a_ptr = A.data() + A.offset();
+    const T *b_ptr = B.data() + B.offset();
+    T *c_ptr = C.data() + C.offset();
 
     TensorInfo info_A(A.shape(), A.strides());
     TensorInfo info_B(B.shape(), B.strides());
     TensorInfo info_C(C.shape(), C.strides());
-
     collapse_dims(info_A, info_B, info_C);
 
     for (size_t i = 0; i < A.total_elements(); ++i) {
         size_t linear_idx = i;
         size_t phys_a = 0, phys_b = 0, phys_c = 0;
-
         for (int d = info_A.ndims - 1; d >= 0; --d) {
             size_t coord = linear_idx % info_A.shape[d];
             linear_idx /= info_A.shape[d];
-
             phys_a += coord * info_A.strides[d];
             phys_b += coord * info_B.strides[d];
             phys_c += coord * info_C.strides[d];
         }
-
-        C_ptr[phys_c] = A_ptr[phys_a] + B_ptr[phys_b];
+        c_ptr[phys_c] = op(a_ptr[phys_a], b_ptr[phys_b]);
     }
 }
 
+template<typename T, typename Op>
+void unary_cpu(const Tensor<T>& A, Tensor<T>& C, Op op) {
+    const T* a = A.data(); 
+    T* c = C.data();
+
+    for (size_t i = 0; i < A.total_elements(); ++i) {
+        c[i] = op(a[i]);
+    }
+}
+
+template<typename T, typename Op>
+void unary_cpu_strided(const Tensor<T>& A, Tensor<T>& C, Op op) {
+    const T *a_ptr = A.data() + A.offset(); 
+    T *c_ptr = C.data() + C.offset();
+
+    TensorInfo info_A(A.shape(), A.strides()); 
+    TensorInfo info_C(C.shape(), C.strides());
+
+    for (size_t i = 0; i < A.total_elements(); ++i) {
+        size_t linear_idx = i;
+        size_t phys_a = 0, phys_c = 0;
+        for (int d = info_A.ndims - 1; d >= 0; --d) {
+            size_t coord = linear_idx % info_A.shape[d];
+            linear_idx /= info_A.shape[d];
+            phys_a += coord * info_A.strides[d]; 
+            phys_c += coord * info_C.strides[d];
+        }
+        c_ptr[phys_c] = op(a_ptr[phys_a]);
+    }
+}
+
+// #############################
+// #   CPU operations
+// #############################
 template<typename T>
 void matmul_cpu(const Tensor<T>& A, const Tensor<T>& B, Tensor<T>& C) {
     size_t M = A.shape()[0];
@@ -142,26 +193,18 @@ Tensor<T> sum_cpu(const Tensor<T>& input, size_t axis, bool keepdims) {
     return output;
 }
 
-// #############################
-// #   GPU operations
-// #############################
+// #######################################################
+// #   Generic GPU Declarations
+// #######################################################
 #if defined(USE_CUDA) || defined(USE_ROCM)
+template<typename T, typename Op> void binary_gpu(const Tensor<T>& A, const Tensor<T>& B, Tensor<T>& C, Op op);
+template<typename T, typename Op> void binary_gpu_strided(const Tensor<T>& A, const Tensor<T>& B, Tensor<T>& C, Op op);
+template<typename T, typename Op> void unary_gpu(const Tensor<T>& A, Tensor<T>& C, Op op);
+template<typename T, typename Op> void unary_gpu_strided(const Tensor<T>& A, Tensor<T>& C, Op op);
 
-template<typename T>
-void add_gpu(const Tensor<T>& A, const Tensor<T>& B, Tensor<T>& C);
-
-template<typename T>
-void add_gpu_strided(const Tensor<T>& A, const Tensor<T>& B, Tensor<T>& C);
-
-template<typename T>
-void matmul_gpu(const Tensor<T>& A, const Tensor<T>& B, Tensor<T>& C);
-
-template<typename T>
-void matmul_gpu_strided(const Tensor<T>& A, const Tensor<T>& B, Tensor<T>& C);
-
-template<typename T>
-Tensor<T> sum_gpu(const Tensor<T>& input, size_t axis, bool keepdims);
-
+template<typename T> void matmul_gpu(const Tensor<T>& A, const Tensor<T>& B, Tensor<T>& C);
+template<typename T> void matmul_gpu_strided(const Tensor<T>& A, const Tensor<T>& B, Tensor<T>& C);
+template<typename T> Tensor<T> sum_gpu(const Tensor<T>& input, size_t axis, bool keepdims);
 #endif
 
 // #############################
@@ -169,51 +212,147 @@ Tensor<T> sum_gpu(const Tensor<T>& input, size_t axis, bool keepdims);
 // #############################
 std::vector<size_t> compute_broadcast_shape(const std::vector<size_t>& shape_a, const std::vector<size_t>& shape_b);
 
-template<typename T>
-Tensor<T> add(const Tensor<T>& A, const Tensor<T>& B) {
-    if (A.device() != B.device()) {
-        throw std::invalid_argument("Tensors must be on the same device to perform addition.");
-    }
-
+template<typename T, typename Op, typename AutogradNodeT>
+Tensor<T> dispatch_binary(const Tensor<T>& A, const Tensor<T>& B, Op op) {
+    if (A.device() != B.device()) throw std::invalid_argument("Device mismatch.");
+    
     std::vector<size_t> out_shape = compute_broadcast_shape(A.shape(), B.shape());
-    Tensor<T> expanded_A = A.expand(out_shape);
-    Tensor<T> expanded_B = B.expand(out_shape);
-
+    Tensor<T> exp_A = A.expand(out_shape); 
+    Tensor<T> exp_B = B.expand(out_shape);
     Tensor<T> C(out_shape, A.device());
 
-    bool all_contiguous = expanded_A.is_contiguous() && expanded_B.is_contiguous() && C.is_contiguous();
+    bool contiguous = exp_A.is_contiguous() && exp_B.is_contiguous() && C.is_contiguous();
 
-    switch (A.device().type) {
-        case DeviceType::CPU: {
-            if (all_contiguous) add_cpu(expanded_A, expanded_B, C);
-            else add_cpu_strided(expanded_A, expanded_B, C);
-            break;
-        }
-        case DeviceType::CUDA: {
+    if (A.device().type == DeviceType::CPU) {
+        if (contiguous) binary_cpu(exp_A, exp_B, C, op); 
+        else binary_cpu_strided(exp_A, exp_B, C, op);
+    } else {
 #if defined(USE_CUDA) || defined(USE_ROCM)
-            if (all_contiguous) add_gpu(expanded_A, expanded_B, C);
-            else add_gpu_strided(expanded_A, expanded_B, C);
+        if (contiguous) binary_gpu(exp_A, exp_B, C, op); 
+        else binary_gpu_strided(exp_A, exp_B, C, op);
 #else
-            throw std::runtime_error("Library was not compiled with GPU support!");
+        throw std::runtime_error("Library was not compiled with GPU support!");
 #endif
-            break;
-        }
-        default:
-            throw std::runtime_error("Unknown device type.");
     }
 
     if (A.requires_grad() || B.requires_grad()) {
         C.set_requires_grad(true);
-        C.set_grad_fn(std::make_shared<AddBackward<T>>(A, B));
+        C.set_grad_fn(std::make_shared<AutogradNodeT>(A, B));
     }
-
     return C;
 }
 
-template<typename T>
-Tensor<T> operator+(const Tensor<T>& A, const Tensor<T>& B) {
-    return add(A, B);
+template<typename T, typename Op>
+void dispatch_binary_inplace(Tensor<T>& A, const Tensor<T>& B, Op op) {
+    if (A.device() != B.device()) {
+        throw std::invalid_argument("Device mismatch.");
+    }
+
+    // Cannot mutate a leaf variable that requires gradients
+    // UNLESS you are operating under a no_grad() context
+    if (GradMode::is_enabled() && A.requires_grad() && A.is_leaf()) {
+        throw std::runtime_error(
+            "A leaf Tensor that requires grad is being used in an in-place operation."
+        );
+    }
+
+    // In-place requires B to be broadcastable to A, but A's shape cannot change!
+    std::vector<size_t> expected_shape = compute_broadcast_shape(A.shape(), B.shape());
+    if (A.shape() != expected_shape) {
+        throw std::invalid_argument(
+            "In-place operation destination tensor cannot be broadcasted to a larger shape."
+        );
+    }
+
+    Tensor<T> exp_B = B.expand(A.shape());
+    bool contiguous = A.is_contiguous() && exp_B.is_contiguous();
+
+    if (A.device().type == DeviceType::CPU) {
+        if (contiguous) binary_cpu(A, exp_B, A, op); 
+        else binary_cpu_strided(A, exp_B, A, op);
+    } else {
+#if defined(USE_CUDA) || defined(USE_ROCM)
+        if (contiguous) binary_gpu(A, exp_B, A, op); 
+        else binary_gpu_strided(A, exp_B, A, op);
+#else
+        throw std::runtime_error("GPU not supported");
+#endif
+    }
+
+    A.bump_version();
 }
+
+template<typename T, typename Op, typename AutogradNodeT, typename... Args>
+Tensor<T> dispatch_unary(const Tensor<T>& A, Op op, Args&&... args) {
+    Tensor<T> C(A.shape(), A.device());
+    
+    if (A.device().type == DeviceType::CPU) {
+        if (A.is_contiguous()) unary_cpu(A, C, op); 
+        else unary_cpu_strided(A, C, op);
+    } else {
+#if defined(USE_CUDA) || defined(USE_ROCM)
+        if (A.is_contiguous()) unary_gpu(A, C, op); 
+        else unary_gpu_strided(A, C, op);
+#else
+        throw std::runtime_error("Library was not compiled with GPU support!");
+#endif
+    }
+
+    if (A.requires_grad()) {
+        C.set_requires_grad(true);
+        C.set_grad_fn(std::make_shared<AutogradNodeT>(A, std::forward<Args>(args)...));
+    }
+    return C;
+}
+
+template<typename T> 
+Tensor<T> add(const Tensor<T>& A, const Tensor<T>& B) { 
+    return dispatch_binary<T, AddOp<T>, AddBackward<T>>(A, B, AddOp<T>{}); 
+}
+
+template<typename T> 
+Tensor<T> operator+(const Tensor<T>& A, const Tensor<T>& B) { 
+    return add(A, B); 
+}
+
+template<typename T> 
+Tensor<T> sub(const Tensor<T>& A, const Tensor<T>& B) { 
+    return dispatch_binary<T, SubOp<T>, SubBackward<T>>(A, B, SubOp<T>{}); 
+}
+
+template<typename T> 
+Tensor<T> operator-(const Tensor<T>& A, const Tensor<T>& B) { 
+    return sub(A, B); 
+}
+
+template<typename T> 
+Tensor<T> mul(const Tensor<T>& A, const Tensor<T>& B) { 
+    return dispatch_binary<T, MulOp<T>, MulBackward<T>>(A, B, MulOp<T>{}); 
+}
+
+template<typename T>
+Tensor<T> operator*(const Tensor<T>& A, const Tensor<T>& B) { 
+    return mul(A, B); 
+}
+
+template<typename T>
+Tensor<T> pow2(const Tensor<T>& A) { 
+    return dispatch_unary<T, Pow2Op<T>, Pow2Backward<T>>(A, Pow2Op<T>{}); 
+}
+
+template<typename T> 
+Tensor<T> mul_scalar(const Tensor<T>& A, T scalar) { 
+    return dispatch_unary<T, MulScalarOp<T>, MulScalarBackward<T>>(A, MulScalarOp<T>{scalar}, scalar); 
+}
+
+template<typename T>
+Tensor<T> operator*(const Tensor<T>& A, T scalar) { 
+    return mul_scalar(A, scalar); 
+}
+
+template<typename T> void sub_(Tensor<T>& A, const Tensor<T>& B) { dispatch_binary_inplace(A, B, SubOp<T>{}); }
+template<typename T> void add_(Tensor<T>& A, const Tensor<T>& B) { dispatch_binary_inplace(A, B, AddOp<T>{}); }
+template<typename T> void mul_(Tensor<T>& A, const Tensor<T>& B) { dispatch_binary_inplace(A, B, MulOp<T>{}); }
 
 template<typename T>
 Tensor<T> matmul(const Tensor<T>& A, const Tensor<T>& B) {
@@ -271,14 +410,16 @@ Tensor<T> matmul(const Tensor<T>& A, const Tensor<T>& B) {
 
 template<typename T>
 Tensor<T> sum(const Tensor<T>& A, size_t axis, bool keepdims) {
+    Tensor<T> output;
+
     switch (A.device().type) {
         case DeviceType::CPU: {
-            return sum_cpu(A, axis, keepdims);
+            output = sum_cpu(A, axis, keepdims);
             break;
         }
         case DeviceType::CUDA: {
 #if defined(USE_CUDA) || defined(USE_ROCM)
-            return sum_gpu(A, axis, keepdims);
+            output = sum_gpu(A, axis, keepdims);
 #else
             throw std::runtime_error("Library was not compiled with GPU support!");
 #endif
@@ -287,8 +428,14 @@ Tensor<T> sum(const Tensor<T>& A, size_t axis, bool keepdims) {
         default:
             throw std::runtime_error("Unknown device type.");
     }
-}
 
+    if (A.requires_grad()) {
+        output.set_requires_grad(true);
+        output.set_grad_fn(std::make_shared<SumBackward<T>>(A, axis, keepdims));
+    }
+
+    return output;
+}
 
 // #############################
 // #   Broadcast
