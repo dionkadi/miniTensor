@@ -52,11 +52,22 @@ public:
     size_t size() const noexcept { return size_; }
 
     void fill(const T& val) {
+        if (device_.type == DeviceType::CPU) {
+            std::fill(data_.get(), data_.get() + size_, val);
+        }
+        else if (device_.type == DeviceType::CUDA) {
+            // GPU Tensors: memset only works correctly for zeroing bytes. 
+            // For non-zero floats (like 1.0f for gradients), the safest/easiest 
+            // way without writing a custom fill_kernel is to do a Host-to-Device copy.
+            std::vector<T> temp(size_, val);
+            size_t bytes = size_ * sizeof(T);
+
 #if defined(USE_CUDA)
-    GPU_CHECK(cudaMemset(data_.get(), val, size_));
+            GPU_CHECK(cudaMemcpy(data_.get(), temp.data(), bytes, cudaMemcpyHostToDevice));
 #elif defined(USE_ROCM)
-    GPU_CHECK(hipMemset(data_.get(), val, size_));
+            GPU_CHECK(hipMemcpy(data_.get(), temp.data(), bytes, hipMemcpyHostToDevice));
 #endif
+        }
     }
 
 private:
