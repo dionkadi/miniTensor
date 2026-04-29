@@ -3,20 +3,24 @@
 #include "TensorImpl.hpp"
 #include <cstddef>
 
-template<typename T>
-__global__ void add_kernel(const T* a, const T* b, T* c, size_t size) {
+// #######################################################
+// #   Generic GPU Kernels
+// #######################################################
+template<typename T, typename Op>
+__global__ void binary_kernel(const T* a, const T* b, T* c, size_t size, Op op) {
     size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < size) {
-        c[idx] = a[idx] + b[idx];
+        c[idx] = op(a[idx], b[idx]);
     }
 }
 
-template<typename T>
-__global__ void add_kernel_strided(
+template<typename T, typename Op>
+__global__ void binary_kernel_strided(
     const T *a, const T *b, T *c, 
     TensorInfo info_A, TensorInfo info_B, TensorInfo info_C,
     size_t size,
-    size_t offset_a, size_t offset_b, size_t offset_c
+    size_t offset_a, size_t offset_b, size_t offset_c,
+    Op op
 ) {
     size_t idx = blockDim.x * blockIdx.x + threadIdx.x;
     if (idx < size) {
@@ -26,16 +30,122 @@ __global__ void add_kernel_strided(
         for (int d = info_A.ndims - 1; d >= 0; --d) {
             size_t coord = linear_idx % info_A.shape[d];
             linear_idx /= info_A.shape[d];
-
             phys_a += coord * info_A.strides[d];
             phys_b += coord * info_B.strides[d];
             phys_c += coord * info_C.strides[d];
         }
-
-        c[offset_c + phys_c] = a[offset_a + phys_a] + b[offset_b + phys_b];
+        c[offset_c + phys_c] = op(a[offset_a + phys_a], b[offset_b + phys_b]);
     }
 }
 
+template<typename T, typename Op>
+__global__ void unary_kernel(const T* a, T* c, size_t size, Op op) {
+    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        c[idx] = op(a[idx]);
+    }
+}
+
+template<typename T, typename Op>
+__global__ void unary_kernel_strided(
+    const T *a, T *c, 
+    TensorInfo info_A, TensorInfo info_C,
+    size_t size, size_t offset_a, size_t offset_c,
+    Op op
+) {
+    size_t idx = blockDim.x * blockIdx.x + threadIdx.x;
+    if (idx < size) {
+        size_t linear_idx = idx;
+        size_t phys_a = 0, phys_c = 0;
+
+        for (int d = info_A.ndims - 1; d >= 0; --d) {
+            size_t coord = linear_idx % info_A.shape[d];
+            linear_idx /= info_A.shape[d];
+            phys_a += coord * info_A.strides[d];
+            phys_c += coord * info_C.strides[d];
+        }
+        c[offset_c + phys_c] = op(a[offset_a + phys_a]);
+    }
+}
+
+// #######################################################
+// #   Generic GPU Execution Setup
+// #######################################################
+template<typename T, typename Op>
+void binary_gpu(const Tensor<T>& A, const Tensor<T>& B, Tensor<T>& C, Op op) {
+    size_t total_elements = A.total_elements();
+    int threads = 256;
+    int blocks = (total_elements + threads - 1) / threads;
+    binary_kernel<<<blocks, threads>>>(A.data(), B.data(), C.data(), total_elements, op);
+    
+#if defined(USE_CUDA)
+    GPU_CHECK(cudaGetLastError()); GPU_CHECK(cudaDeviceSynchronize());
+#elif defined(USE_ROCM)
+    GPU_CHECK(hipGetLastError()); GPU_CHECK(hipDeviceSynchronize());
+#endif
+}
+
+template<typename T, typename Op>
+void binary_gpu_strided(const Tensor<T>& A, const Tensor<T>& B, Tensor<T>& C, Op op) {
+    size_t total_elements = A.total_elements();
+    size_t threads = 256;
+    size_t blocks = (total_elements + threads - 1) / threads;
+
+    TensorInfo info_A(A.shape(), A.strides());
+    TensorInfo info_B(B.shape(), B.strides());
+    TensorInfo info_C(C.shape(), C.strides());
+    collapse_dims(info_A, info_B, info_C);
+
+    binary_kernel_strided<<<blocks, threads>>>(
+        A.data(), B.data(), C.data(), info_A, info_B, info_C,
+        total_elements, A.offset(), B.offset(), C.offset(), op
+    );
+
+#if defined(USE_CUDA)
+    GPU_CHECK(cudaGetLastError()); GPU_CHECK(cudaDeviceSynchronize());
+#elif defined(USE_ROCM)
+    GPU_CHECK(hipGetLastError()); GPU_CHECK(hipDeviceSynchronize());
+#endif
+}
+
+template<typename T, typename Op>
+void unary_gpu(const Tensor<T>& A, Tensor<T>& C, Op op) {
+    size_t total_elements = A.total_elements();
+    int threads = 256;
+    int blocks = (total_elements + threads - 1) / threads;
+    unary_kernel<<<blocks, threads>>>(A.data(), C.data(), total_elements, op);
+    
+#if defined(USE_CUDA)
+    GPU_CHECK(cudaGetLastError()); GPU_CHECK(cudaDeviceSynchronize());
+#elif defined(USE_ROCM)
+    GPU_CHECK(hipGetLastError()); GPU_CHECK(hipDeviceSynchronize());
+#endif
+}
+
+template<typename T, typename Op>
+void unary_gpu_strided(const Tensor<T>& A, Tensor<T>& C, Op op) {
+    size_t total_elements = A.total_elements();
+    size_t threads = 256;
+    size_t blocks = (total_elements + threads - 1) / threads;
+
+    TensorInfo info_A(A.shape(), A.strides());
+    TensorInfo info_C(C.shape(), C.strides());
+
+    unary_kernel_strided<<<blocks, threads>>>(
+        A.data(), C.data(), info_A, info_C,
+        total_elements, A.offset(), C.offset(), op
+    );
+
+#if defined(USE_CUDA)
+    GPU_CHECK(cudaGetLastError()); GPU_CHECK(cudaDeviceSynchronize());
+#elif defined(USE_ROCM)
+    GPU_CHECK(hipGetLastError()); GPU_CHECK(hipDeviceSynchronize());
+#endif
+}
+
+// #######################################################
+// #   Non-Generic Ops
+// #######################################################
 template<typename T>
 __global__ void matmul_kernel(
     const T *a, const T *b, T *c,
@@ -55,54 +165,27 @@ __global__ void matmul_kernel(
 }
 
 template<typename T>
-void add_gpu(const Tensor<T>& A, const Tensor<T>& B, Tensor<T>& C) {
-    size_t total_elements = A.total_elements();
+__global__ void matmul_kernel_strided(
+    const T* a, const T* b, T* c, 
+    size_t M, size_t K, size_t N,
+    size_t stride_a_m, size_t stride_a_k,
+    size_t stride_b_k, size_t stride_b_n,
+    size_t stride_c_m, size_t stride_c_n,
+    size_t offset_a, size_t offset_b, size_t offset_c
+) { 
+    size_t row = blockIdx.y * blockDim.y + threadIdx.y;
+    size_t col = blockIdx.x * blockDim.x + threadIdx.x;
 
-    int threads = 256;
-    int blocks = (total_elements + threads - 1) / threads;
-
-    add_kernel<<<blocks, threads>>>(A.data(), B.data(), C.data(), total_elements);
-    
-#if defined(USE_CUDA)
-    GPU_CHECK(cudaGetLastError());
-    GPU_CHECK(cudaDeviceSynchronize());
-#elif defined(USE_ROCM)
-    GPU_CHECK(hipGetLastError());
-    GPU_CHECK(hipDeviceSynchronize());
-#endif
+    if (row < M && col < N) {
+        T sum = 0;
+        for (size_t k = 0; k < K; ++k) {
+            T a_val = a[offset_a + row * stride_a_m + k * stride_a_k];
+            T b_val = b[offset_b + k * stride_b_k + col * stride_b_n];
+            sum += a_val * b_val;
+        }
+        c[offset_c + row * stride_c_m + col * stride_c_n] = sum;
+    }
 }
-
-template<typename T>
-void add_gpu_strided(const Tensor<T>& A, const Tensor<T>& B, Tensor<T>& C) {
-    size_t total_elements = A.total_elements();
-
-    size_t threads = 256;
-    size_t blocks = (total_elements + threads - 1) / threads;
-
-    TensorInfo info_A(A.shape(), A.strides());
-    TensorInfo info_B(B.shape(), B.strides());
-    TensorInfo info_C(C.shape(), C.strides());
-
-    collapse_dims(info_A, info_B, info_C);
-
-    add_kernel_strided<<<blocks, threads>>>(
-        A.data(), B.data(), C.data(),
-        info_A, info_B, info_C,
-        total_elements,
-        A.offset(), B.offset(), C.offset()
-    );
-
-#if defined(USE_CUDA)
-    GPU_CHECK(cudaGetLastError());
-    GPU_CHECK(cudaDeviceSynchronize());
-#elif defined(USE_ROCM)
-    GPU_CHECK(hipGetLastError());
-    GPU_CHECK(hipDeviceSynchronize());
-#endif
-}
-
-template void add_gpu<float>(const Tensor<float>& A, const Tensor<float>& B, Tensor<float>& C);
-template void add_gpu_strided<float>(const Tensor<float>&, const Tensor<float>&, Tensor<float>&);
 
 template<typename T>
 void matmul_gpu(const Tensor<T>& A, const Tensor<T>& B, Tensor<T>& C) {
@@ -128,29 +211,6 @@ void matmul_gpu(const Tensor<T>& A, const Tensor<T>& B, Tensor<T>& C) {
     GPU_CHECK(hipGetLastError());
     GPU_CHECK(hipDeviceSynchronize());
 #endif
-}
-
-template<typename T>
-__global__ void matmul_kernel_strided(
-    const T* a, const T* b, T* c, 
-    size_t M, size_t K, size_t N,
-    size_t stride_a_m, size_t stride_a_k,
-    size_t stride_b_k, size_t stride_b_n,
-    size_t stride_c_m, size_t stride_c_n,
-    size_t offset_a, size_t offset_b, size_t offset_c
-) { 
-    size_t row = blockIdx.y * blockDim.y + threadIdx.y;
-    size_t col = blockIdx.x * blockDim.x + threadIdx.x;
-
-    if (row < M && col < N) {
-        T sum = 0;
-        for (size_t k = 0; k < K; ++k) {
-            T a_val = a[offset_a + row * stride_a_m + k * stride_a_k];
-            T b_val = b[offset_b + k * stride_b_k + col * stride_b_n];
-            sum += a_val * b_val;
-        }
-        c[offset_c + row * stride_c_m + col * stride_c_n] = sum;
-    }
 }
 
 template<typename T>
@@ -180,9 +240,6 @@ void matmul_gpu_strided(const Tensor<T>& A, const Tensor<T>& B, Tensor<T>& C) {
     GPU_CHECK(hipDeviceSynchronize());
 #endif
 }
-
-template void matmul_gpu<float>(const Tensor<float>& A, const Tensor<float>& B, Tensor<float>& C);
-template void matmul_gpu_strided<float>(const Tensor<float>& A, const Tensor<float>& B, Tensor<float>& C);
 
 template<typename T>
 __global__ void sum_kernel(
@@ -278,4 +335,21 @@ Tensor<T> sum_gpu(const Tensor<T>& input, size_t axis, bool keepdims) {
     return output;
 }
 
+// #######################################################
+// #   Explicit Instantiations
+// #######################################################
+template void binary_gpu<float, AddOp<float>>(const Tensor<float>&, const Tensor<float>&, Tensor<float>&, AddOp<float>);
+template void binary_gpu_strided<float, AddOp<float>>(const Tensor<float>&, const Tensor<float>&, Tensor<float>&, AddOp<float>);
+template void binary_gpu<float, SubOp<float>>(const Tensor<float>&, const Tensor<float>&, Tensor<float>&, SubOp<float>);
+template void binary_gpu_strided<float, SubOp<float>>(const Tensor<float>&, const Tensor<float>&, Tensor<float>&, SubOp<float>);
+template void binary_gpu<float, MulOp<float>>(const Tensor<float>&, const Tensor<float>&, Tensor<float>&, MulOp<float>);
+template void binary_gpu_strided<float, MulOp<float>>(const Tensor<float>&, const Tensor<float>&, Tensor<float>&, MulOp<float>);
+
+template void unary_gpu<float, Pow2Op<float>>(const Tensor<float>&, Tensor<float>&, Pow2Op<float>);
+template void unary_gpu_strided<float, Pow2Op<float>>(const Tensor<float>&, Tensor<float>&, Pow2Op<float>);
+template void unary_gpu<float, MulScalarOp<float>>(const Tensor<float>&, Tensor<float>&, MulScalarOp<float>);
+template void unary_gpu_strided<float, MulScalarOp<float>>(const Tensor<float>&, Tensor<float>&, MulScalarOp<float>);
+
+template void matmul_gpu<float>(const Tensor<float>&, const Tensor<float>&, Tensor<float>&);
+template void matmul_gpu_strided<float>(const Tensor<float>&, const Tensor<float>&, Tensor<float>&);
 template Tensor<float> sum_gpu<float>(const Tensor<float>&, size_t, bool);
