@@ -344,11 +344,19 @@ template void binary_gpu<float, SubOp<float>>(const Tensor<float>&, const Tensor
 template void binary_gpu_strided<float, SubOp<float>>(const Tensor<float>&, const Tensor<float>&, Tensor<float>&, SubOp<float>);
 template void binary_gpu<float, MulOp<float>>(const Tensor<float>&, const Tensor<float>&, Tensor<float>&, MulOp<float>);
 template void binary_gpu_strided<float, MulOp<float>>(const Tensor<float>&, const Tensor<float>&, Tensor<float>&, MulOp<float>);
+template void binary_gpu<float, ReLUGradOp<float>>(const Tensor<float>&, const Tensor<float>&, Tensor<float>&, ReLUGradOp<float>);
+template void binary_gpu_strided<float, ReLUGradOp<float>>(const Tensor<float>&, const Tensor<float>&, Tensor<float>&, ReLUGradOp<float>);
 
 template void unary_gpu<float, Pow2Op<float>>(const Tensor<float>&, Tensor<float>&, Pow2Op<float>);
 template void unary_gpu_strided<float, Pow2Op<float>>(const Tensor<float>&, Tensor<float>&, Pow2Op<float>);
 template void unary_gpu<float, MulScalarOp<float>>(const Tensor<float>&, Tensor<float>&, MulScalarOp<float>);
 template void unary_gpu_strided<float, MulScalarOp<float>>(const Tensor<float>&, Tensor<float>&, MulScalarOp<float>);
+template void unary_gpu<float, ReLUOp<float>>(Tensor<float> const&, Tensor<float>&, ReLUOp<float>);
+template void unary_gpu_strided<float, ReLUOp<float>>(Tensor<float> const&, Tensor<float>&, ReLUOp<float>);
+template void unary_gpu<float, SigmoidOp<float>>(Tensor<float> const&, Tensor<float>&, SigmoidOp<float>);
+template void unary_gpu_strided<float, SigmoidOp<float>>(Tensor<float> const&, Tensor<float>&, SigmoidOp<float>);
+template void unary_gpu<float, TanhOp<float>>(Tensor<float> const&, Tensor<float>&, TanhOp<float>);
+template void unary_gpu_strided<float, TanhOp<float>>(Tensor<float> const&, Tensor<float>&, TanhOp<float>);
 
 template void matmul_gpu<float>(const Tensor<float>&, const Tensor<float>&, Tensor<float>&);
 template void matmul_gpu_strided<float>(const Tensor<float>&, const Tensor<float>&, Tensor<float>&);
