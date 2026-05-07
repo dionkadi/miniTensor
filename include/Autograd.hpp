@@ -63,6 +63,8 @@ struct AddBackward : public AutogradNode<T> {
     AddBackward(Tensor<T> a, Tensor<T> b) : saved_a(a), saved_b(b) {}
 
     void apply(const Tensor<T>& grad_output) override {
+        NoGradGuard guard;
+
         Tensor<T> tensor_a = saved_a.unpack();
         Tensor<T> tensor_b = saved_b.unpack();
 
@@ -92,6 +94,8 @@ struct SubBackward : public AutogradNode<T> {
     SubBackward(Tensor<T> a, Tensor<T> b) : saved_a(a), saved_b(b) {}
 
     void apply(const Tensor<T>& grad_output) override {
+        NoGradGuard guard;
+
         Tensor<T> tensor_a = saved_a.unpack();
         Tensor<T> tensor_b = saved_b.unpack();
 
@@ -118,6 +122,8 @@ struct MatmulBackward : public AutogradNode<T> {
     MatmulBackward(Tensor<T> a, Tensor<T> b) : saved_a(a), saved_b(b) {}
 
     void apply(const Tensor<T>& grad_output) override {
+        NoGradGuard guard;
+
         Tensor<T> tensor_a = saved_a.unpack();
         Tensor<T> tensor_b = saved_b.unpack();
 
@@ -148,6 +154,8 @@ struct MulScalarBackward : public AutogradNode<T> {
     MulScalarBackward(Tensor<T> a, T s) : saved_a(a), scalar(s) {}
 
     void apply(const Tensor<T>& grad_output) override {
+        NoGradGuard guard;
+
         Tensor<T> tensor_a = saved_a.unpack();
 
         if (tensor_a.requires_grad()) {
@@ -169,6 +177,8 @@ struct MulBackward : public AutogradNode<T> {
     MulBackward(Tensor<T> a, Tensor<T> b) : saved_a(a), saved_b(b) {}
 
     void apply(const Tensor<T>& grad_output) override {
+        NoGradGuard guard;
+
         Tensor<T> tensor_a = saved_a.unpack();
         Tensor<T> tensor_b = saved_b.unpack();
 
@@ -198,6 +208,8 @@ struct Pow2Backward : public AutogradNode<T> {
     Pow2Backward(Tensor<T> a) : saved_a(a) {}
 
     void apply(const Tensor<T>& grad_output) override {
+        NoGradGuard guard;
+
         Tensor<T> tensor_a = saved_a.unpack();
 
         // C = A^2
@@ -221,6 +233,8 @@ struct SumBackward : public AutogradNode<T> {
         : saved_input(input), axis(axis), keepdims(keepdims) {}
 
     void apply(const Tensor<T>& grad_output) override {
+        NoGradGuard guard;
+
         Tensor<T> input = saved_input.unpack();
         if (!input.requires_grad()) return;
 
@@ -231,6 +245,12 @@ struct SumBackward : public AutogradNode<T> {
         std::vector<size_t> target_shape = input.shape();
         
         Tensor<T> grad_expanded = grad_output;
+
+        // Materialize non-contiguous expanded tensors before reshaping
+        // By multiplying by 1.0, dispatch_unary allocates a fresh, contiguous tensor.
+        if (!grad_expanded.is_contiguous()) {
+            grad_expanded = grad_expanded * (T)1.0; 
+        }
         
         if (!keepdims) {
             // Insert a dimension of size 1 at the reduction axis to match target_shape
@@ -247,4 +267,137 @@ struct SumBackward : public AutogradNode<T> {
     std::vector<Tensor<T>> get_inputs() const override {
         return {saved_input.unpack()};
     }
+};
+
+template<typename T> 
+struct ExpBackward : public AutogradNode<T> {
+    SavedTensor<T> saved_a;
+    
+    ExpBackward(Tensor<T> a) : saved_a(a) {}
+    
+    // d/dx [e^x] = e^x
+    void apply(const Tensor<T>& grad_output) override {
+        NoGradGuard guard;
+
+        Tensor<T> a = saved_a.unpack();
+        if (a.requires_grad()) {
+            NoGradGuard guard; // Prevent higher-order graph building
+            a.accumulate_grad(grad_output * exp(a));
+        }
+    }
+
+    std::vector<Tensor<T>> get_inputs() const override { return {saved_a.unpack()}; }
+};
+
+template<typename T> struct LogBackward : public AutogradNode<T> {
+    SavedTensor<T> saved_a;
+
+    LogBackward(Tensor<T> a) : saved_a(a) {}
+    
+    // d/dx [\ln(x)] = 1/x
+    void apply(const Tensor<T>& grad_output) override {
+        NoGradGuard guard;
+
+        Tensor<T> a = saved_a.unpack();
+        if (a.requires_grad()) {
+            NoGradGuard guard;
+            a.accumulate_grad(grad_output / a);
+        }
+    }
+
+    std::vector<Tensor<T>> get_inputs() const override { return {saved_a.unpack()}; }
+};
+
+template<typename T> struct DivBackward : public AutogradNode<T> {
+    SavedTensor<T> saved_a;
+    SavedTensor<T> saved_b;
+    
+    DivBackward(Tensor<T> a, Tensor<T> b) : saved_a(a), saved_b(b) {}
+    
+    // d/dA [A/B] = 1/B  |  d/dB [A/B] = -A / B^2
+    void apply(const Tensor<T>& grad_output) override {
+        NoGradGuard guard;
+
+        Tensor<T> a = saved_a.unpack();
+        Tensor<T> b = saved_b.unpack();
+        
+        if (a.requires_grad()) {
+            Tensor<T> grad_a = unbroadcast(grad_output / b, a.shape());
+            a.accumulate_grad(grad_a);
+        }
+        if (b.requires_grad()) {
+            Tensor<T> b_sq = b * b;
+            Tensor<T> neg_a = a * (T)-1.0;
+            Tensor<T> grad_b_raw = neg_a / b_sq;
+            Tensor<T> grad_b = unbroadcast(grad_output * grad_b_raw, b.shape());
+            b.accumulate_grad(grad_b);
+        }
+    }
+
+    std::vector<Tensor<T>> get_inputs() const override { return {saved_a.unpack(), saved_b.unpack()}; }
+};
+
+template<typename T>
+struct ReLUBackward : public AutogradNode<T> {
+    SavedTensor<T> saved_a;
+
+    ReLUBackward(Tensor<T> a) : saved_a(a) {}
+
+    void apply(const Tensor<T>& grad_output) override {
+        NoGradGuard guard;
+
+        Tensor<T> a = saved_a.unpack();
+
+        if (a.requires_grad()) {
+            a.accumulate_grad(relu_grad(a, grad_output));
+        }
+    }
+
+    std::vector<Tensor<T>> get_inputs() const override { return {saved_a.unpack()}; }
+};
+
+template<typename T> struct SigmoidBackward : public AutogradNode<T> {
+    SavedTensor<T> saved_a;
+
+    SigmoidBackward(Tensor<T> a) : saved_a(a) {}
+
+    void apply(const Tensor<T>& grad_output) override {
+        NoGradGuard guard;
+
+        Tensor<T> a = saved_a.unpack();
+
+        if (a.requires_grad()) {
+            Tensor<T> s = sigmoid(a);
+            // d(Sigmoid)/dx = s * (1 - s)
+            Tensor<T> one = Tensor<T>::ones_like(s.shape(), s.device());
+            Tensor<T> one_minus_s = one - s;
+            Tensor<T> ds = s * one_minus_s;
+            a.accumulate_grad(grad_output * ds);
+        }
+    }
+
+    std::vector<Tensor<T>> get_inputs() const override { return {saved_a.unpack()}; }
+};
+
+template<typename T> struct TanhBackward : public AutogradNode<T> {
+    SavedTensor<T> saved_a;
+
+    TanhBackward(Tensor<T> a) : saved_a(a) {}
+
+    void apply(const Tensor<T>& grad_output) override {
+        NoGradGuard guard;
+
+        Tensor<T> a = saved_a.unpack();
+
+        if (a.requires_grad()) {
+            Tensor<T> t = tanh(a);
+            // d(Tanh)/dx = 1 - t^2
+            Tensor<T> t_sq = pow2(t);
+            Tensor<T> one = Tensor<T>::ones_like(t.shape(), t.device());
+            Tensor<T> dt = one - t_sq;
+            a.accumulate_grad(grad_output * dt);
+        }
+    }
+    
+    std::vector<Tensor<T>> get_inputs() const override { return {saved_a.unpack()}; }
 };

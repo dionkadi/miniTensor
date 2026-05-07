@@ -19,20 +19,33 @@ template<typename T> struct AddOp { HD_INLINE T operator()(T a, T b) const { ret
 template<typename T> struct SubOp { HD_INLINE T operator()(T a, T b) const { return a - b; } };
 template<typename T> struct MulOp { HD_INLINE T operator()(T a, T b) const { return a * b; } };
 template<typename T> struct Pow2Op { HD_INLINE T operator()(T a) const { return a * a; } };
+template<typename T> struct ExpOp { HD_INLINE T operator()(T a) const { return exp(a); } };
+template<typename T> struct LogOp { HD_INLINE T operator()(T a) const { return log(a); } };
+template<typename T> struct DivOp { HD_INLINE T operator()(T a, T b) const { return a / b; } };
 template<typename T> struct MulScalarOp { 
     T scalar;
     HD_INLINE MulScalarOp(T s) : scalar(s) {}
     HD_INLINE T operator()(T a) const { return a * scalar; } 
 };
 
+template<typename T> struct ReLUOp { 
+    HD_INLINE T operator()(T a) const { return a > (T)0.0 ? a : (T)0.0; }
+};
+template<typename T> struct ReLUGradOp { 
+    HD_INLINE T operator()(T a, T grad_out) const { return a > (T)0.0 ? grad_out : (T)0.0; }
+};
+
+template<typename T> struct SigmoidOp { HD_INLINE T operator()(T a) const { return (T)1.0 / ((T)1.0 + exp(-a)); } };
+template<typename T> struct TanhOp { HD_INLINE T operator()(T a) const { return tanh(a); } };
+
 // #######################################################
 // #   Generic CPU Execution Engine
 // #######################################################
 template<typename T, typename Op>
 void binary_cpu(const Tensor<T>& A, const Tensor<T>& B, Tensor<T>& C, Op op) {
-    const T* a_ptr = A.data();
-    const T* b_ptr = B.data();
-    T* c_ptr = C.data();
+    const T* a_ptr = A.data() + A.offset();
+    const T* b_ptr = B.data() + B.offset();
+    T* c_ptr = C.data() + C.offset();
     for (size_t i = 0; i < A.total_elements(); ++i) {
         c_ptr[i] = op(a_ptr[i], b_ptr[i]);
     }
@@ -65,8 +78,8 @@ void binary_cpu_strided(const Tensor<T>& A, const Tensor<T>& B, Tensor<T>& C, Op
 
 template<typename T, typename Op>
 void unary_cpu(const Tensor<T>& A, Tensor<T>& C, Op op) {
-    const T* a = A.data(); 
-    T* c = C.data();
+    const T* a = A.data() + A.offset(); 
+    T* c = C.data() + C.offset();
 
     for (size_t i = 0; i < A.total_elements(); ++i) {
         c[i] = op(a[i]);
@@ -235,7 +248,7 @@ Tensor<T> dispatch_binary(const Tensor<T>& A, const Tensor<T>& B, Op op) {
 #endif
     }
 
-    if (A.requires_grad() || B.requires_grad()) {
+    if (GradMode::is_enabled() && (A.requires_grad() || B.requires_grad())) {
         C.set_requires_grad(true);
         C.set_grad_fn(std::make_shared<AutogradNodeT>(A, B));
     }
@@ -298,7 +311,7 @@ Tensor<T> dispatch_unary(const Tensor<T>& A, Op op, Args&&... args) {
 #endif
     }
 
-    if (A.requires_grad()) {
+    if (GradMode::is_enabled() && A.requires_grad()) {
         C.set_requires_grad(true);
         C.set_grad_fn(std::make_shared<AutogradNodeT>(A, std::forward<Args>(args)...));
     }
@@ -335,9 +348,29 @@ Tensor<T> operator*(const Tensor<T>& A, const Tensor<T>& B) {
     return mul(A, B); 
 }
 
+template<typename T> 
+Tensor<T> div(const Tensor<T>& A, const Tensor<T>& B) { 
+    return dispatch_binary<T, DivOp<T>, DivBackward<T>>(A, B, DivOp<T>{}); 
+}
+
+template<typename T>
+Tensor<T> operator/(const Tensor<T>& A, const Tensor<T>& B) { 
+    return div(A, B); 
+}
+
 template<typename T>
 Tensor<T> pow2(const Tensor<T>& A) { 
     return dispatch_unary<T, Pow2Op<T>, Pow2Backward<T>>(A, Pow2Op<T>{}); 
+}
+
+template<typename T>
+Tensor<T> exp(const Tensor<T>& A) { 
+    return dispatch_unary<T, ExpOp<T>, ExpBackward<T>>(A, ExpOp<T>{}); 
+}
+
+template<typename T>
+Tensor<T> log(const Tensor<T>& A) { 
+    return dispatch_unary<T, LogOp<T>, LogBackward<T>>(A, LogOp<T>{}); 
 }
 
 template<typename T> 
@@ -429,12 +462,34 @@ Tensor<T> sum(const Tensor<T>& A, size_t axis, bool keepdims) {
             throw std::runtime_error("Unknown device type.");
     }
 
-    if (A.requires_grad()) {
+    if (A.requires_grad() && GradMode::is_enabled()) {
         output.set_requires_grad(true);
         output.set_grad_fn(std::make_shared<SumBackward<T>>(A, axis, keepdims));
     }
 
     return output;
+}
+
+template<typename T> 
+Tensor<T> relu(const Tensor<T>& A) { 
+    return dispatch_unary<T, ReLUOp<T>, ReLUBackward<T>>(A, ReLUOp<T>{}); 
+}
+
+template<typename T>
+Tensor<T> relu_grad(const Tensor<T>& a, const Tensor<T>& grad_output) {
+    // Dispatch using a dummy AutogradNode. Since we use NoGradGuard in Autograd.hpp, 
+    // the node will be ignored and no graph will be built.
+    return dispatch_binary<T, ReLUGradOp<T>, AddBackward<T>>(a, grad_output, ReLUGradOp<T>{}); 
+}
+
+template<typename T> 
+Tensor<T> sigmoid(const Tensor<T>& A) { 
+    return dispatch_unary<T, SigmoidOp<T>, SigmoidBackward<T>>(A, SigmoidOp<T>{}); 
+}
+
+template<typename T> 
+Tensor<T> tanh(const Tensor<T>& A) { 
+    return dispatch_unary<T, TanhOp<T>, TanhBackward<T>>(A, TanhOp<T>{}); 
 }
 
 // #############################
@@ -461,6 +516,8 @@ inline std::vector<size_t> compute_broadcast_shape(const std::vector<size_t>& sh
 
 template <typename T>
 Tensor<T> unbroadcast(Tensor<T> grad, const std::vector<size_t>& target_shape) {
+    NoGradGuard guard;
+
     const auto& grad_shape = grad.shape();
 
     if (grad_shape == target_shape) {
@@ -485,6 +542,10 @@ Tensor<T> unbroadcast(Tensor<T> grad, const std::vector<size_t>& target_shape) {
         if (target_shape[i] == 1 && result.shape()[i] > 1) {
             result = sum(result, i, true);
         }
+    }
+
+    if (!result.is_contiguous()) {
+        result = result * (T)1.0;
     }
 
     return result;
