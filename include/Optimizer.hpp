@@ -36,8 +36,8 @@ public:
         for (auto& p : this->parameters_) {
             if (p.grad().empty()) continue;
             
-            Tensor<T> step_size = p.grad() * lr_;
-            sub_(p, step_size); 
+            Tensor<T> step = p.grad() * lr_;
+            sub_(p, step); 
         }
     }
 };
