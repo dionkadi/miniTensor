@@ -16,7 +16,7 @@ public:
 
     Tensor() : impl_(nullptr) {}
 
-    Tensor(std::vector<size_t> shape, Device device = {DeviceType::CPU}) {
+    Tensor(std::vector<size_t> shape, Device device = {}) {
         size_t total_elements = std::accumulate(shape.begin(), shape.end(), 1UL, std::multiplies<size_t>{});
         auto storage = std::make_shared<TensorStorage<T>>(total_elements, device);
         auto strides = compute_strides(shape);
@@ -37,7 +37,7 @@ public:
     Self reshape(const std::vector<size_t>& new_shape) const { return impl_->reshape(new_shape); }
     Self to(Device target_device) const { return impl_->to(target_device); }
 
-    bool empty() const noexcept { return impl_ == nullptr || impl_->shape_.empty(); }
+    bool empty() const noexcept { return impl_ == nullptr || total_elements() == 0; }
     const std::vector<size_t>& shape() const noexcept { return impl_->shape_; }
     const std::vector<size_t>& strides() const noexcept { return impl_->strides_; }
     Device device() const noexcept { return impl_->storage_->device(); }
