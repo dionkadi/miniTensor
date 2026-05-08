@@ -401,3 +401,84 @@ template<typename T> struct TanhBackward : public AutogradNode<T> {
     
     std::vector<Tensor<T>> get_inputs() const override { return {saved_a.unpack()}; }
 };
+
+template<typename T>
+struct FlattenBackward : public AutogradNode<T> {
+    SavedTensor<T> saved_input;
+    std::vector<size_t> original_shape;
+
+    FlattenBackward(Tensor<T> input) : saved_input(input), original_shape(input.shape()) {}
+
+    void apply(const Tensor<T>& grad_output) override {
+        NoGradGuard guard;
+        Tensor<T> input = saved_input.unpack();
+        if (input.requires_grad()) {
+            input.accumulate_grad(grad_output.reshape(original_shape));
+        }
+    }
+
+    std::vector<Tensor<T>> get_inputs() const override { return {saved_input.unpack()}; }
+};
+
+template<typename T>
+struct MaxPool2DBackward : public AutogradNode<T> {
+    SavedTensor<T> saved_input;
+    std::vector<size_t> indices;
+
+    MaxPool2DBackward(Tensor<T> input, std::vector<size_t> idxs) 
+        : saved_input(input), indices(std::move(idxs)) {}
+
+    void apply(const Tensor<T>& grad_output) override {
+        NoGradGuard guard;
+        Tensor<T> input = saved_input.unpack();
+        if (input.requires_grad()) {
+            Tensor<T> grad_input(input.shape(), input.device());
+            max_pool2d_backward(grad_output, grad_input, indices);
+            input.accumulate_grad(grad_input);
+        }
+    }
+
+    std::vector<Tensor<T>> get_inputs() const override { return {saved_input.unpack()}; }
+};
+
+template<typename T>
+struct Conv2DBackward : public AutogradNode<T> {
+    SavedTensor<T> saved_input;
+    SavedTensor<T> saved_weight;
+    SavedTensor<T> saved_bias;
+    size_t stride;
+    size_t padding;
+
+    Conv2DBackward(Tensor<T> input, Tensor<T> weight, Tensor<T> bias, size_t s, size_t p)
+        : saved_input(input), saved_weight(weight), saved_bias(bias), stride(s), padding(p) {}
+
+    void apply(const Tensor<T>& grad_output) override {
+        NoGradGuard guard;
+        
+        Tensor<T> input     = saved_input.unpack();
+        Tensor<T> weight    = saved_weight.unpack();
+        Tensor<T> bias      = saved_bias.unpack();
+
+        if (input.requires_grad()) {
+            Tensor<T> grad_input(input.shape(), input.device());
+            conv2d_backward_input(grad_output, weight, grad_input, stride, padding);
+            input.accumulate_grad(grad_input);
+        }
+
+        if (weight.requires_grad()) {
+            Tensor<T> grad_weight(weight.shape(), weight.device());
+            conv2d_backward_weight(grad_output, input, grad_weight, stride, padding);
+            weight.accumulate_grad(grad_weight);
+        }
+
+        if (bias.requires_grad()) {
+            Tensor<T> grad_bias(bias.shape(), bias.device());
+            conv2d_backward_bias(grad_output, grad_bias);
+            bias.accumulate_grad(grad_bias);
+        }
+    }
+
+    std::vector<Tensor<T>> get_inputs() const override { 
+        return {saved_input.unpack(), saved_weight.unpack(), saved_bias.unpack()}; 
+    }
+};

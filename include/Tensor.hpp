@@ -36,6 +36,7 @@ public:
     Self expand(const std::vector<size_t>& target_shape) const { return impl_->expand(target_shape); }
     Self reshape(const std::vector<size_t>& new_shape) const { return impl_->reshape(new_shape); }
     Self to(Device target_device) const { return impl_->to(target_device); }
+    Self contiguous() const { return *this * (T)1.0; }
 
     bool empty() const noexcept { return impl_ == nullptr || total_elements() == 0; }
     const std::vector<size_t>& shape() const noexcept { return impl_->shape_; }

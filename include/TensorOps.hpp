@@ -22,6 +22,12 @@ template<typename T> struct Pow2Op { HD_INLINE T operator()(T a) const { return 
 template<typename T> struct ExpOp { HD_INLINE T operator()(T a) const { return exp(a); } };
 template<typename T> struct LogOp { HD_INLINE T operator()(T a) const { return log(a); } };
 template<typename T> struct DivOp { HD_INLINE T operator()(T a, T b) const { return a / b; } };
+template<typename T> struct SqrtOp { HD_INLINE T operator()(T a) const { return sqrt(a); } };
+template<typename T> struct AddScalarOp { 
+    T scalar;
+    HD_INLINE AddScalarOp(T s) : scalar(s) {}
+    HD_INLINE T operator()(T a) const { return a + scalar; } 
+};  
 template<typename T> struct MulScalarOp { 
     T scalar;
     HD_INLINE MulScalarOp(T s) : scalar(s) {}
@@ -181,7 +187,6 @@ Tensor<T> sum_cpu(const Tensor<T>& input, size_t axis, bool keepdims) {
     
     size_t axis_size = in_shape[axis];
     size_t axis_stride = in_strides[axis];
-    size_t in_ndims = in_shape.size();
     
     size_t out_elements = output.total_elements();
     
@@ -189,11 +194,12 @@ Tensor<T> sum_cpu(const Tensor<T>& input, size_t axis, bool keepdims) {
         size_t linear_idx = i;
         size_t in_phys_base = 0;
         
-        for (int d = in_ndims - 1; d >= 0; --d) {
-            size_t coord = linear_idx % in_shape[d];
-            linear_idx /= in_shape[d];
+        for (int d = out_shape.size() - 1; d >= 0; --d) {
+            size_t coord = linear_idx % out_shape[d];
+            linear_idx /= out_shape[d];
 
-            in_phys_base += coord * in_strides[d];
+            int in_d = keepdims ? d : (d >= (int)axis ? d + 1 : d);
+            in_phys_base += coord * in_strides[in_d];
         }
         
         T sum = 0;
@@ -204,6 +210,297 @@ Tensor<T> sum_cpu(const Tensor<T>& input, size_t axis, bool keepdims) {
     }
     
     return output;
+}
+
+template<typename T>
+void conv2d_cpu(const Tensor<T>& input, const Tensor<T>& weight, const Tensor<T>& bias, Tensor<T>& output, size_t stride, size_t padding) {
+    size_t N = input.shape()[0], C_in = input.shape()[1], H = input.shape()[2], W = input.shape()[3];
+    size_t C_out = weight.shape()[0], kH = weight.shape()[2], kW = weight.shape()[3];
+    size_t H_out = output.shape()[2], W_out = output.shape()[3];
+
+    const T* in_ptr = input.data() + input.offset();
+    const T* w_ptr = weight.data() + weight.offset();
+    const T* b_ptr = bias.empty() ? nullptr : bias.data() + bias.offset();
+    T* out_ptr = output.data() + output.offset();
+
+    // Naive 6-nested loop
+    for (size_t n = 0; n < N; ++n) {
+        for (size_t c_out = 0; c_out < C_out; ++c_out) {
+            for (size_t y = 0; y < H_out; ++y) {
+                for (size_t x = 0; x < W_out; ++x) {
+                    T val = b_ptr ? b_ptr[c_out] : (T)0.0;
+
+                    for (size_t c_in = 0; c_in < C_in; ++c_in) {
+                        for (size_t r = 0; r < kH; ++r) {
+                            for (size_t s = 0; s < kW; ++s) {
+                                int in_y = y * stride + r - padding;
+                                int in_x = x * stride + s - padding;
+
+                                if (in_y >= 0 && in_y < (int)H && in_x >= 0 && in_x < (int)W) {
+                                    size_t in_idx = n * (C_in * H * W) + c_in * (H * W) + in_y * W + in_x;
+                                    size_t w_idx = c_out * (C_in * kH * kW) + c_in * (kH * kW) + r * kW + s;
+                                    val += in_ptr[in_idx] * w_ptr[w_idx];
+                                }
+                            }
+                        }
+                    }
+                    size_t out_idx = n * (C_out * H_out * W_out) + c_out * (H_out * W_out) + y * W_out + x;
+                    out_ptr[out_idx] = val;
+                }
+            }
+        }
+    }
+}
+
+template<typename T>
+void conv2d_cpu_strided(const Tensor<T>& input, const Tensor<T>& weight, const Tensor<T>& bias, Tensor<T>& output, size_t stride, size_t padding) {
+    size_t N = input.shape()[0], C_in = input.shape()[1], H = input.shape()[2], W = input.shape()[3];
+    size_t C_out = weight.shape()[0], kH = weight.shape()[2], kW = weight.shape()[3];
+    size_t H_out = output.shape()[2], W_out = output.shape()[3];
+
+    const T* in_ptr = input.data() + input.offset();
+    const T* w_ptr = weight.data() + weight.offset();
+    const T* b_ptr = bias.empty() ? nullptr : bias.data() + bias.offset();
+    T* out_ptr = output.data() + output.offset();
+
+    auto in_strides = input.strides();
+    auto w_strides = weight.strides();
+    auto out_strides = output.strides();
+
+    // Naive 6-nested loop
+    for (size_t n = 0; n < N; ++n) {
+        for (size_t c_out = 0; c_out < C_out; ++c_out) {
+            for (size_t y = 0; y < H_out; ++y) {
+                for (size_t x = 0; x < W_out; ++x) {
+                    T val = b_ptr ? b_ptr[c_out * w_strides[0]] : (T)0.0;
+
+                    for (size_t c_in = 0; c_in < C_in; ++c_in) {
+                        for (size_t r = 0; r < kH; ++r) {
+                            for (size_t s = 0; s < kW; ++s) {
+                                int in_y = y * stride + r - padding;
+                                int in_x = x * stride + s - padding;
+
+                                if (in_y >= 0 && in_y < (int)H && in_x >= 0 && in_x < (int)W) {
+                                    size_t in_idx = n * in_strides[0] + c_in * in_strides[1] + in_y * in_strides[2] + in_x * in_strides[3];
+                                    size_t w_idx = c_out * w_strides[0] + c_in * w_strides[1] + r * w_strides[2] + s * w_strides[3];
+                                    val += in_ptr[in_idx] * w_ptr[w_idx];
+                                }
+                            }
+                        }
+                    }
+                    size_t out_idx = n * out_strides[0] + c_out * out_strides[1] + y * out_strides[2] + x * out_strides[3];
+                    out_ptr[out_idx] = val;
+                }
+            }
+        }
+    }
+}
+
+template<typename T>
+void conv2d_backward_input_cpu(const Tensor<T>& grad_output, const Tensor<T>& weight, Tensor<T>& grad_input, size_t stride, size_t padding) {
+    size_t N = grad_input.shape()[0], C_in = grad_input.shape()[1],
+           H_in = grad_input.shape()[2], W_in = grad_input.shape()[3];
+    size_t C_out = weight.shape()[0], kH = weight.shape()[2], kW = weight.shape()[3];
+    size_t H_out = grad_output.shape()[2], W_out = grad_output.shape()[3];
+
+    const T* go = grad_output.data() + grad_output.offset();
+    const T* wt = weight.data() + weight.offset();
+    T* gi = grad_input.data() + grad_input.offset();
+
+    std::fill(gi, gi + grad_input.total_elements(), (T)0);
+
+    for (size_t n = 0; n < N; ++n) {
+        for (size_t c_out = 0; c_out < C_out; ++c_out) {
+            for (size_t y = 0; y < H_out; ++y) {
+                for (size_t x = 0; x < W_out; ++x) {
+                    T go_val = go[n * (C_out * H_out * W_out) + c_out * (H_out * W_out) + y * W_out + x];
+                    for (size_t c_in = 0; c_in < C_in; ++c_in) {
+                        for (size_t r = 0; r < kH; ++r) {
+                            for (size_t s_ = 0; s_ < kW; ++s_) {
+                                int in_y = static_cast<int>(y * stride + r - padding);
+                                int in_x = static_cast<int>(x * stride + s_ - padding);
+                                if (in_y >= 0 && in_y < static_cast<int>(H_in) &&
+                                    in_x >= 0 && in_x < static_cast<int>(W_in))
+                                {
+                                    size_t in_idx = n * (C_in * H_in * W_in) + c_in * (H_in * W_in) + in_y * W_in + in_x;
+                                    size_t w_idx = c_out * (C_in * kH * kW) + c_in * (kH * kW) + r * kW + s_;
+                                    gi[in_idx] += go_val * wt[w_idx];
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+template<typename T>
+void conv2d_backward_weight_cpu(const Tensor<T>& grad_output, const Tensor<T>& input, Tensor<T>& grad_weight, size_t stride, size_t padding) {
+    size_t N = input.shape()[0], C_in = input.shape()[1], H = input.shape()[2], W = input.shape()[3];
+    size_t C_out = grad_weight.shape()[0], kH = grad_weight.shape()[2], kW = grad_weight.shape()[3];
+    size_t H_out = grad_output.shape()[2], W_out = grad_output.shape()[3];
+
+    const T* go = grad_output.data() + grad_output.offset();
+    const T* in = input.data() + input.offset();
+    T* gw = grad_weight.data() + grad_weight.offset();
+
+    std::fill(gw, gw + grad_weight.total_elements(), (T)0);
+
+    for (size_t n = 0; n < N; ++n) {
+        for (size_t c_out = 0; c_out < C_out; ++c_out) {
+            for (size_t c_in = 0; c_in < C_in; ++c_in) {
+                for (size_t r = 0; r < kH; ++r) {
+                    for (size_t s_ = 0; s_ < kW; ++s_) {
+                        T sum = 0;
+                        for (size_t y = 0; y < H_out; ++y) {
+                            for (size_t x = 0; x < W_out; ++x) {
+                                int in_y = static_cast<int>(y * stride + r - padding);
+                                int in_x = static_cast<int>(x * stride + s_ - padding);
+                                if (in_y >= 0 && in_y < static_cast<int>(H) &&
+                                    in_x >= 0 && in_x < static_cast<int>(W))
+                                {
+                                    size_t in_idx = n * (C_in * H * W) + c_in * (H * W) + in_y * W + in_x;
+                                    size_t go_idx = n * (C_out * H_out * W_out) + c_out * (H_out * W_out) + y * W_out + x;
+                                    sum += in[in_idx] * go[go_idx];
+                                }
+                            }
+                        }
+                        size_t w_idx = c_out * (C_in * kH * kW) + c_in * (kH * kW) + r * kW + s_;
+                        gw[w_idx] += sum;
+                    }
+                }
+            }
+        }
+    }
+}
+
+template<typename T>
+void conv2d_backward_bias_cpu(const Tensor<T>& grad_output, Tensor<T>& grad_bias) {
+    size_t N = grad_output.shape()[0], C_out = grad_output.shape()[1], H_out = grad_output.shape()[2], W_out = grad_output.shape()[3];
+    
+    const T* go = grad_output.data() + grad_output.offset();
+    T* gb = grad_bias.data() + grad_bias.offset();
+    
+    std::fill(gb, gb + C_out, (T)0);
+    
+    for (size_t n = 0; n < N; ++n) {
+        for (size_t c = 0; c < C_out; ++c) {
+            T sum = 0;
+            for (size_t y = 0; y < H_out; ++y) {
+                for (size_t x = 0; x < W_out; ++x) {
+                    sum += go[n * (C_out * H_out * W_out) + c * (H_out * W_out) + y * W_out + x];
+                }
+            }
+            gb[c] += sum;
+        }
+    }
+}
+
+template<typename T>
+std::pair<Tensor<T>, std::vector<size_t>>   // output tensor + flat indices
+max_pool2d_cpu(const Tensor<T>& input, size_t k, size_t stride, size_t padding)
+{
+    size_t N = input.shape()[0], C = input.shape()[1], H = input.shape()[2], W = input.shape()[3];
+    size_t H_out = (H + 2 * padding - k) / stride + 1;
+    size_t W_out = (W + 2 * padding - k) / stride + 1;
+
+    Tensor<T> output({N, C, H_out, W_out}, input.device());
+    std::vector<size_t> indices(N * C * H_out * W_out); // flat indices
+
+    const T* in_ptr = input.data() + input.offset();
+    T* out_ptr = output.data() + output.offset();
+
+    for (size_t n = 0; n < N; ++n) {
+        for (size_t c = 0; c < C; ++c) {
+            for (size_t y = 0; y < H_out; ++y) {
+                for (size_t x = 0; x < W_out; ++x) {
+                    T max_val = -std::numeric_limits<T>::infinity();
+                    size_t max_flat = 0;
+                    for (size_t r = 0; r < k; ++r) {
+                        for (size_t s_ = 0; s_ < k; ++s_) {
+                            int in_y = static_cast<int>(y * stride + r - padding);
+                            int in_x = static_cast<int>(x * stride + s_ - padding);
+                            if (in_y >= 0 && in_y < static_cast<int>(H) &&
+                                in_x >= 0 && in_x < static_cast<int>(W))
+                            {
+                                size_t flat = (n * C + c) * (H * W) + in_y * W + in_x;
+                                T val = in_ptr[flat];
+                                if (val > max_val) {
+                                    max_val = val;
+                                    max_flat = flat;
+                                }
+                            }
+                        }
+                    }
+                    out_ptr[(n * C + c) * (H_out * W_out) + y * W_out + x] = max_val;
+                    size_t idx = ((n * C + c) * H_out + y) * W_out + x;
+                    indices[idx] = max_flat;
+                }
+            }
+        }
+    }
+    return {output, indices};
+}
+
+template<typename T>
+std::pair<Tensor<T>, std::vector<size_t>>   // output tensor + flat indices
+max_pool2d_cpu_strided(const Tensor<T>& input, size_t k, size_t stride, size_t padding)
+{
+    size_t N = input.shape()[0], C = input.shape()[1], H = input.shape()[2], W = input.shape()[3];
+    size_t H_out = (H + 2 * padding - k) / stride + 1;
+    size_t W_out = (W + 2 * padding - k) / stride + 1;
+
+    Tensor<T> output({N, C, H_out, W_out}, input.device());
+    std::vector<size_t> indices(N * C * H_out * W_out); // flat indices
+
+    const T* in_ptr = input.data() + input.offset();
+    T* out_ptr = output.data() + output.offset();
+
+    const auto& in_strides = input.strides();
+
+    for (size_t n = 0; n < N; ++n) {
+        for (size_t c = 0; c < C; ++c) {
+            for (size_t y = 0; y < H_out; ++y) {
+                for (size_t x = 0; x < W_out; ++x) {
+                    T max_val = -std::numeric_limits<T>::infinity();
+                    size_t max_flat = 0;
+                    for (size_t r = 0; r < k; ++r) {
+                        for (size_t s_ = 0; s_ < k; ++s_) {
+                            int in_y = static_cast<int>(y * stride + r - padding);
+                            int in_x = static_cast<int>(x * stride + s_ - padding);
+                            if (in_y >= 0 && in_y < static_cast<int>(H) &&
+                                in_x >= 0 && in_x < static_cast<int>(W))
+                            {
+                                size_t flat = n * in_strides[0] + c * in_strides[1] + in_y * in_strides[2] + in_x * in_strides[3];
+                                T val = in_ptr[flat];
+                                if (val > max_val) {
+                                    max_val = val;
+                                    max_flat = ((n * C + c) * H + in_y) * W + in_x;
+                                }
+                            }
+                        }
+                    }
+                    size_t idx = n * in_strides[0] + c * in_strides[1] + y * in_strides[2] + x * in_strides[3];
+                    out_ptr[idx] = max_val;
+                    indices[idx] = max_flat;
+                }
+            }
+        }
+    }
+    return {output, indices};
+}
+
+template<typename T>
+void max_pool2d_backward_cpu(const Tensor<T>& grad_output, Tensor<T>& grad_input, const std::vector<size_t>& indices) {
+    const T* go_ptr = grad_output.data() + grad_output.offset();
+    T* gi_ptr = grad_input.data() + grad_input.offset();
+    
+    std::fill(gi_ptr, gi_ptr + grad_input.total_elements(), (T)0);
+    
+    for (size_t i = 0; i < grad_output.total_elements(); ++i) {
+        gi_ptr[indices[i]] += go_ptr[i];
+    }
 }
 
 // #######################################################
@@ -218,6 +515,15 @@ template<typename T, typename Op> void unary_gpu_strided(const Tensor<T>& A, Ten
 template<typename T> void matmul_gpu(const Tensor<T>& A, const Tensor<T>& B, Tensor<T>& C);
 template<typename T> void matmul_gpu_strided(const Tensor<T>& A, const Tensor<T>& B, Tensor<T>& C);
 template<typename T> Tensor<T> sum_gpu(const Tensor<T>& input, size_t axis, bool keepdims);
+template<typename T> void conv2d_gpu(const Tensor<T>& input, const Tensor<T>& weight, const Tensor<T>& bias, Tensor<T>& output, size_t stride, size_t padding);
+template<typename T> void conv2d_gpu_strided(const Tensor<T>& input, const Tensor<T>& weight, const Tensor<T>& bias, Tensor<T>& output, size_t stride, size_t padding);
+template<typename T> void conv2d_backward_input_gpu(const Tensor<T>& grad_output, const Tensor<T>& weight, Tensor<T>& grad_input, size_t stride, size_t padding);
+template<typename T> void conv2d_backward_weight_gpu(const Tensor<T>& grad_output, const Tensor<T>& input, Tensor<T>& grad_weight, size_t stride, size_t padding);
+template<typename T> void conv2d_backward_bias_gpu(const Tensor<T>& grad_output, Tensor<T>& grad_bias);
+template<typename T> std::pair<Tensor<T>, std::vector<size_t>> max_pool2d_gpu(const Tensor<T>& input, size_t k, size_t stride, size_t padding);
+template<typename T> std::pair<Tensor<T>, std::vector<size_t>> max_pool2d_gpu_strided(const Tensor<T>& input, size_t k, size_t stride, size_t padding);
+template<typename T> void max_pool2d_backward_gpu(const Tensor<T>& grad_output, Tensor<T>& grad_input, const std::vector<size_t>& h_indices);
+template<typename T> void max_pool2d_backward_gpu_strided(const Tensor<T>& grad_output, Tensor<T>& grad_input, const std::vector<size_t>& h_indices);
 #endif
 
 // #############################
@@ -373,6 +679,21 @@ Tensor<T> log(const Tensor<T>& A) {
     return dispatch_unary<T, LogOp<T>, LogBackward<T>>(A, LogOp<T>{}); 
 }
 
+template<typename T>
+Tensor<T> sqrt(const Tensor<T>& A) { 
+    return dispatch_unary<T, SqrtOp<T>, Pow2Backward<T>>(A, SqrtOp<T>{}); 
+}
+
+template<typename T> 
+Tensor<T> add_scalar(const Tensor<T>& A, T scalar) { 
+    return dispatch_unary<T, AddScalarOp<T>, AddBackward<T>>(A, AddScalarOp<T>{scalar}, scalar); 
+}
+
+template<typename T>
+Tensor<T> operator+(const Tensor<T>& A, T scalar) { 
+    return add_scalar(A, scalar); 
+}
+
 template<typename T> 
 Tensor<T> mul_scalar(const Tensor<T>& A, T scalar) { 
     return dispatch_unary<T, MulScalarOp<T>, MulScalarBackward<T>>(A, MulScalarOp<T>{scalar}, scalar); 
@@ -381,6 +702,20 @@ Tensor<T> mul_scalar(const Tensor<T>& A, T scalar) {
 template<typename T>
 Tensor<T> operator*(const Tensor<T>& A, T scalar) { 
     return mul_scalar(A, scalar); 
+}
+
+template<typename T>
+Tensor<T> flatten(const Tensor<T>& x) {
+    if (x.shape().empty()) return x;
+    size_t batch = x.shape()[0];
+    size_t rest = x.total_elements() / batch;
+    Tensor<T> out = x.reshape({batch, rest});
+    
+    if (GradMode::is_enabled() && x.requires_grad()) {
+        out.set_requires_grad(true);
+        out.set_grad_fn(std::make_shared<FlattenBackward<T>>(x));
+    }
+    return out;
 }
 
 template<typename T> void sub_(Tensor<T>& A, const Tensor<T>& B) { dispatch_binary_inplace(A, B, SubOp<T>{}); }
@@ -468,6 +803,133 @@ Tensor<T> sum(const Tensor<T>& A, size_t axis, bool keepdims) {
     }
 
     return output;
+}
+
+template<typename T>
+Tensor<T> conv2d(const Tensor<T>& input, const Tensor<T>& weight, const Tensor<T>& bias, size_t stride, size_t padding) {
+    if (input.device() != weight.device() || (!bias.empty() && input.device() != bias.device()))
+        throw std::invalid_argument("Device mismatch.");
+    
+    size_t N = input.shape()[0], /* C_in = input.shape()[1] */ H = input.shape()[2], W = input.shape()[3];
+    size_t C_out = weight.shape()[0], kH = weight.shape()[2], kW = weight.shape()[3];
+    size_t H_out = (H + 2 * padding - kH) / stride + 1;
+    size_t W_out = (W + 2 * padding - kW) / stride + 1;
+
+    Tensor<T> output({N, C_out, H_out, W_out}, input.device());
+
+    bool contiguous = input.is_contiguous() && weight.is_contiguous() &&
+                      (bias.empty() || bias.is_contiguous()) && output.is_contiguous();
+
+    if (input.device().type == DeviceType::CPU) {
+        if (contiguous) conv2d_cpu(input, weight, bias, output, stride, padding);
+        else conv2d_cpu_strided(input, weight, bias, output, stride, padding);
+    } else {
+#if defined(USE_CUDA) || defined(USE_ROCM)
+        if (contiguous) conv2d_gpu(input, weight, bias, output, stride, padding);
+        else conv2d_gpu_strided(input, weight, bias, output, stride, padding);
+#else
+        throw std::runtime_error("GPU not supported");
+#endif
+    }
+
+    if (GradMode::is_enabled() && (input.requires_grad() || weight.requires_grad() ||
+        (!bias.empty() && bias.requires_grad())))
+    {
+        output.set_requires_grad(true);
+        output.set_grad_fn(std::make_shared<Conv2DBackward<T>>(input, weight, bias, stride, padding));
+    }
+    return output;
+}
+
+template<typename T> 
+void conv2d_backward_input(const Tensor<T>& grad_output, const Tensor<T>& weight, Tensor<T>& grad_input, size_t stride, size_t padding) {
+    if (grad_input.device().type == DeviceType::CPU) {
+        conv2d_backward_input_cpu(grad_output, weight, grad_input, stride, padding);
+    } else {
+#if defined(USE_CUDA) || defined(USE_ROCM)
+        conv2d_backward_input_gpu(grad_output, weight, grad_input, stride, padding); 
+#else
+        throw std::runtime_error("Library was not compiled with GPU support!");
+#endif
+    }
+}
+
+template<typename T> 
+void conv2d_backward_weight(const Tensor<T>& grad_output, const Tensor<T>& input, Tensor<T>& grad_weight, size_t stride, size_t padding) {
+    if (grad_weight.device().type == DeviceType::CPU) {
+        conv2d_backward_weight_cpu(grad_output, input, grad_weight, stride, padding);
+    } else {
+#if defined(USE_CUDA) || defined(USE_ROCM)
+        conv2d_backward_weight_gpu(grad_output, input, grad_weight, stride, padding); 
+#else
+        throw std::runtime_error("Library was not compiled with GPU support!");
+#endif
+    }
+}
+
+template<typename T> 
+void conv2d_backward_bias(const Tensor<T>& grad_output, Tensor<T>& grad_bias) {
+    if (grad_bias.device().type == DeviceType::CPU) {
+        conv2d_backward_bias_cpu(grad_output, grad_bias);
+    } else {
+#if defined(USE_CUDA) || defined(USE_ROCM)
+        conv2d_backward_bias_gpu(grad_output, grad_bias); 
+#else
+        throw std::runtime_error("Library was not compiled with GPU support!");
+#endif
+    }
+}
+
+template<typename T>
+Tensor<T> max_pool2d(const Tensor<T>& input, size_t kernel_size, size_t stride, size_t padding) {
+    Tensor<T> output;
+    std::vector<size_t> indices;
+
+    if (input.device().type == DeviceType::CPU) {
+        if (input.is_contiguous()) {
+            auto res = max_pool2d_cpu(input, kernel_size, stride, padding);
+            output = res.first;
+            indices = res.second;
+        } else {
+            auto res = max_pool2d_cpu_strided(input, kernel_size, stride, padding);
+            output = res.first;
+            indices = res.second;
+        }
+    } else {
+#if defined(USE_CUDA) || defined(USE_ROCM)
+        if (input.is_contiguous()) {
+            auto res = max_pool2d_gpu(input, kernel_size, stride, padding);
+            output = res.first;
+            indices = res.second;
+        } else {
+            auto res = max_pool2d_gpu_strided(input, kernel_size, stride, padding);
+            output = res.first;
+            indices = res.second;
+        }
+#else
+        throw std::runtime_error("Library was not compiled with GPU support!");
+#endif
+    }
+
+    if (GradMode::is_enabled() && input.requires_grad()) {
+        output.set_requires_grad(true);
+        output.set_grad_fn(std::make_shared<MaxPool2DBackward<T>>(input, indices));
+    }
+    
+    return output;
+}
+
+template<typename T>
+void max_pool2d_backward(const Tensor<T>& grad_output, Tensor<T>& grad_input, const std::vector<size_t>& indices) {
+    if (grad_input.device() == DeviceType::CPU) {
+        max_pool2d_backward_cpu(grad_output, grad_input, indices);
+    } else {
+#if defined(USE_CUDA) || defined(USE_ROCM)
+        max_pool2d_backward_gpu(grad_output, grad_input, indices); 
+#else
+        throw std::runtime_error("Library was not compiled with GPU support!");
+#endif
+    }
 }
 
 template<typename T> 
