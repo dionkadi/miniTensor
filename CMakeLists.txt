@@ -61,7 +61,9 @@ find_package(GTest REQUIRED)
 add_executable(tensor_tests 
     # test/tensor_test.cpp
     # test/linear_regression_test.cpp
-    test/engien_test.cpp
+    # test/engien_test.cpp
+    # test/nn_test.cpp
+    test/spatial_test.cpp
 )
 target_include_directories(tensor_tests PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 
