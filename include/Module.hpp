@@ -16,6 +16,7 @@ public:
     
     virtual Tensor<T> forward(const Tensor<T>& x) = 0;
     virtual std::vector<Tensor<T>> parameters() const = 0; 
+    virtual void to(Device) {}
 
     Tensor<T> operator()(const Tensor<T>& x) {
         return forward(x);
@@ -90,8 +91,12 @@ public:
     std::vector<Tensor<T>> parameters() const override {
         return {weight_, bias_};
     }
-};
 
+    void to(Device device) override {
+        weight_ = weight_.to(device);
+        bias_ = bias_.to(device);
+    }
+};
 
 template<typename T>
 class Sequential : public Module<T> {
@@ -118,6 +123,12 @@ public:
             all_params.insert(all_params.end(), mod_params.begin(), mod_params.end());
         }
         return all_params;
+    }
+
+    void to(Device device) override {
+        for (auto& mod : modules_) {
+            mod->to(device);
+        }
     }
 };
 
@@ -174,6 +185,13 @@ public:
         if (bias_.empty()) return {weight_};
         return {weight_, bias_};
     }
+
+    void to(Device device) override {
+        weight_ = weight_.to(device);
+        if (!bias_.empty()) {
+            bias_ = bias_.to(device);
+        }
+    }
 };
 
 template<typename T>
@@ -181,8 +199,8 @@ class MaxPool2D : public Module<T> {
     size_t kernel_size_, stride_, padding_;
     
 public:
-    MaxPool2D(size_t kernel_size, size_t stride = 1, size_t padding = 0)
-        : kernel_size_(kernel_size), stride_(stride), padding_(padding) {}
+    MaxPool2D(size_t kernel_size, size_t stride = 0, size_t padding = 0)
+        : kernel_size_(kernel_size), stride_(stride == 0 ? kernel_size : stride), padding_(padding) {}
 
     Tensor<T> forward(const Tensor<T>& x) override {
         return max_pool2d(x, kernel_size_, stride_, padding_);

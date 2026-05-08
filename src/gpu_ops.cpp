@@ -969,6 +969,16 @@ template void unary_gpu_strided<float, SigmoidOp<float>>(Tensor<float> const&, T
 template void unary_gpu<float, TanhOp<float>>(Tensor<float> const&, Tensor<float>&, TanhOp<float>);
 template void unary_gpu_strided<float, TanhOp<float>>(Tensor<float> const&, Tensor<float>&, TanhOp<float>);
 template void unary_gpu_strided<float, IdentityOp<float>>(Tensor<float> const&, Tensor<float>&, IdentityOp<float>);
+template void unary_gpu<float, ExpOp<float>>(Tensor<float> const&, Tensor<float>&, ExpOp<float>);
+template void unary_gpu_strided<float, ExpOp<float>>(Tensor<float> const&, Tensor<float>&, ExpOp<float>);
+template void binary_gpu<float, DivOp<float>>(Tensor<float> const&, Tensor<float> const&, Tensor<float>&, DivOp<float>);
+template void binary_gpu_strided<float, DivOp<float>>(Tensor<float> const&, Tensor<float> const&, Tensor<float>&, DivOp<float>);
+template void unary_gpu<float, LogOp<float>>(Tensor<float> const&, Tensor<float>&, LogOp<float>);
+template void unary_gpu_strided<float, LogOp<float>>(Tensor<float> const&, Tensor<float>&, LogOp<float>);
+template void unary_gpu<float, AddScalarOp<float>>(Tensor<float> const&, Tensor<float>&, AddScalarOp<float>);
+template void unary_gpu_strided<float, AddScalarOp<float>>(Tensor<float> const&, Tensor<float>&, AddScalarOp<float>);
+template void unary_gpu<float, SqrtOp<float>>(Tensor<float> const&, Tensor<float>&, SqrtOp<float>);
+template void unary_gpu_strided<float, SqrtOp<float>>(Tensor<float> const&, Tensor<float>&, SqrtOp<float>);
 
 template void matmul_gpu<float>(const Tensor<float>&, const Tensor<float>&, Tensor<float>&);
 template void matmul_gpu_strided<float>(const Tensor<float>&, const Tensor<float>&, Tensor<float>&);

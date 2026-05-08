@@ -47,7 +47,6 @@ public:
 
 template<typename T>
 std::pair<Tensor<T>, Tensor<T>> default_collate(const std::vector<std::pair<Tensor<T>, Tensor<T>>>& batch_items) {
-    // Assuming you have a concat() or stack() function in your library
     std::vector<Tensor<T>> batch_features;
     std::vector<Tensor<T>> batch_labels;
     
@@ -57,7 +56,7 @@ std::pair<Tensor<T>, Tensor<T>> default_collate(const std::vector<std::pair<Tens
     }
     
     // Stack along dimension 0
-    return { stack(batch_features, 0), stack(batch_labels, 0) };
+    return { concat(batch_features, 0), concat(batch_labels, 0) };
 }
 
 

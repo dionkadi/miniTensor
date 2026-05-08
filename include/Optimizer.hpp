@@ -65,7 +65,7 @@ private:
 
 public:
     Adam(const std::vector<Tensor<T>>& params, T lr = 0.001, T beta1 = 0.9, T beta2 = 0.999, T eps = 1e-8, T weight_decay = (T)0.0) 
-        : Optimizer<T>(params), lr_(lr), beta1_(beta1), beta2_(beta2), eps_(eps), t_(0), weight_decay_(weight_decay)
+        : Optimizer<T>(params), lr_(lr), beta1_(beta1), beta2_(beta2), eps_(eps), weight_decay_(weight_decay), t_(0)
     {
         
         // Initialize moment buffers to zero with the exact same shape and device as the parameters

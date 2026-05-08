@@ -830,7 +830,7 @@ Tensor<T> sqrt(const Tensor<T>& A) {
 
 template<typename T> 
 Tensor<T> add_scalar(const Tensor<T>& A, T scalar) { 
-    return dispatch_unary<T, AddScalarOp<T>, AddBackward<T>>(A, AddScalarOp<T>{scalar}, scalar); 
+    return dispatch_unary<T, AddScalarOp<T>, AddScalarBackward<T>>(A, AddScalarOp<T>{scalar}, scalar); 
 }
 
 template<typename T>
@@ -1138,6 +1138,13 @@ Tensor<T> unbroadcast(Tensor<T> grad, const std::vector<size_t>& target_shape) {
     NoGradGuard guard;
 
     const auto& grad_shape = grad.shape();
+
+    if (grad_shape.empty()) {
+        if (target_shape.empty()) {
+            return grad;
+        }
+        throw std::invalid_argument("Cannot unbroadcast a scalar to a non‑scalar shape");
+    }
 
     if (grad_shape == target_shape) {
         return grad;

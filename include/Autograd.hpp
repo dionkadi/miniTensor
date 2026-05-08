@@ -170,6 +170,27 @@ struct MulScalarBackward : public AutogradNode<T> {
 };
 
 template<typename T>
+struct AddScalarBackward : public AutogradNode<T> {
+    SavedTensor<T> saved_a;
+    T scalar; 
+
+    AddScalarBackward(Tensor<T> a, T s) : saved_a(a), scalar(s) {}
+
+    void apply(const Tensor<T>& grad_output) override {
+        NoGradGuard guard;
+        Tensor<T> tensor_a = saved_a.unpack();
+        if (tensor_a.requires_grad()) {
+            // d(A + scalar)/dA = 1, so gradient is just grad_output
+            tensor_a.accumulate_grad(grad_output);
+        }
+    }
+
+    std::vector<Tensor<T>> get_inputs() const override {
+        return {saved_a.unpack()};
+    }
+};
+
+template<typename T>
 struct MulBackward : public AutogradNode<T> {
     SavedTensor<T> saved_a;
     SavedTensor<T> saved_b;

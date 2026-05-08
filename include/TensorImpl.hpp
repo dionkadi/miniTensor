@@ -197,11 +197,11 @@ struct TensorImpl {
         std::swap(new_shape[dim0], new_shape[dim1]);
         std::swap(new_strides[dim0], new_strides[dim1]);
 
-        return Tensor(std::make_shared<Self>(storage_, new_shape, new_strides, offset_));
+        return Tensor(std::make_shared<Self>(storage_, new_shape, new_strides, offset_, requires_grad_));
     }
 
     Tensor<T> expand(const std::vector<size_t>& target_shape) const {
-        if (shape_ == target_shape) return Tensor<T>(std::make_shared<Self>(storage_, shape_, strides_, offset_));
+        if (shape_ == target_shape) return Tensor<T>(std::make_shared<Self>(storage_, shape_, strides_, offset_, requires_grad_));
 
         std::vector<size_t> new_strides(target_shape.size(), 0);
         int offset = target_shape.size() - shape_.size();
@@ -223,7 +223,7 @@ struct TensorImpl {
             new_strides[i] = (current_dim == target_shape[i]) ? current_stride : 0;
         }
 
-        return Tensor(std::make_shared<Self>(storage_, target_shape, new_strides, offset_));
+        return Tensor(std::make_shared<Self>(storage_, target_shape, new_strides, offset_, requires_grad_));
     }
 
     Tensor<T> reshape(const std::vector<size_t>& new_shape) const {
@@ -239,12 +239,12 @@ struct TensorImpl {
             stride *= new_shape[i];
         }
 
-        return Tensor<T>(std::make_shared<Self>(storage_, new_shape, new_strides, offset_));
+        return Tensor<T>(std::make_shared<Self>(storage_, new_shape, new_strides, offset_, requires_grad_));
     }
 
     Tensor<T> to(Device target_device) const {
         if (this->device() == target_device) {
-            return Tensor<T>(std::make_shared<Self>(storage_, shape_, strides_, offset_));
+            return Tensor<T>(std::make_shared<Self>(storage_, shape_, strides_, offset_, requires_grad_));
         }
 
         size_t total_elements = storage_->size();
@@ -273,7 +273,7 @@ struct TensorImpl {
 #endif
         }
 
-        return Tensor<T>(std::make_shared<Self>(new_storage, shape_, strides_, offset_));
+        return Tensor<T>(std::make_shared<Self>(new_storage, shape_, strides_, offset_, requires_grad_));
     }
 
     bool is_contiguous() const noexcept {
