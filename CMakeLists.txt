@@ -63,7 +63,10 @@ add_executable(tensor_tests
     # test/linear_regression_test.cpp
     # test/engien_test.cpp
     # test/nn_test.cpp
-    test/spatial_test.cpp
+    # test/spatial_test.cpp
+    # test/func_test.cpp
+    # test/dataset_test.cpp
+    test/mnist.cpp
 )
 target_include_directories(tensor_tests PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 
