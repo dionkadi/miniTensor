@@ -904,6 +904,48 @@ void max_pool2d_backward_gpu(
 #endif
 }
 
+template<typename T>
+__global__ void copy_kernel_strided(
+    const T *src, T *dst, 
+    TensorInfo info,
+    size_t size,
+    size_t offset_src, size_t offset_dst
+) {
+    size_t idx = blockDim.x * blockIdx.x + threadIdx.x;
+    if (idx < size) {
+        size_t linear_idx = idx;
+        size_t phys_src = 0, phys_dst = 0;
+
+        for (int d = info.ndims - 1; d >= 0; --d) {
+            size_t coord = linear_idx % info.shape[d];
+            linear_idx /= info.shape[d];
+            phys_src += coord * info.strides[d];
+        }
+
+        dst[offset_dst + idx] = src[phys_src + offset_src];
+    }
+}
+
+template<typename T>
+void copy_gpu_strided(const Tensor<T> src, T* dst) {
+    size_t total_elements = src.total_elements();
+
+    size_t threads = 256;
+    size_t blocks = (total_elements + threads - 1) / threads;
+
+    TensorInfo info(src.shape(), src.strides());
+
+    copy_kernel_strided<<<blocks, threads>>>(
+        src.data(), dst, info, total_elements, src.offset(), 0
+    );
+
+#if defined(USE_CUDA)
+    GPU_CHECK(cudaGetLastError()); GPU_CHECK(cudaDeviceSynchronize());
+#elif defined(USE_ROCM)
+    GPU_CHECK(hipGetLastError()); GPU_CHECK(hipDeviceSynchronize());
+#endif
+}
+
 // #######################################################
 // #   Explicit Instantiations
 // #######################################################
@@ -926,6 +968,7 @@ template void unary_gpu<float, SigmoidOp<float>>(Tensor<float> const&, Tensor<fl
 template void unary_gpu_strided<float, SigmoidOp<float>>(Tensor<float> const&, Tensor<float>&, SigmoidOp<float>);
 template void unary_gpu<float, TanhOp<float>>(Tensor<float> const&, Tensor<float>&, TanhOp<float>);
 template void unary_gpu_strided<float, TanhOp<float>>(Tensor<float> const&, Tensor<float>&, TanhOp<float>);
+template void unary_gpu_strided<float, IdentityOp<float>>(Tensor<float> const&, Tensor<float>&, IdentityOp<float>);
 
 template void matmul_gpu<float>(const Tensor<float>&, const Tensor<float>&, Tensor<float>&);
 template void matmul_gpu_strided<float>(const Tensor<float>&, const Tensor<float>&, Tensor<float>&);
@@ -939,3 +982,4 @@ template void conv2d_backward_input_gpu<float>(Tensor<float> const&, Tensor<floa
 template void conv2d_backward_weight_gpu<float>(Tensor<float> const&, Tensor<float> const&, Tensor<float>&, unsigned long, unsigned long);
 template void conv2d_backward_bias_gpu<float>(Tensor<float> const&, Tensor<float>&);
 template void max_pool2d_backward_gpu<float>(Tensor<float> const&, Tensor<float>&, std::vector<unsigned long, std::allocator<unsigned long>> const&);
+template void copy_gpu_strided<float>(const Tensor<float> src, float* dst);

@@ -36,7 +36,38 @@ public:
     Self expand(const std::vector<size_t>& target_shape) const { return impl_->expand(target_shape); }
     Self reshape(const std::vector<size_t>& new_shape) const { return impl_->reshape(new_shape); }
     Self to(Device target_device) const { return impl_->to(target_device); }
-    Self contiguous() const { return *this * (T)1.0; }
+    Self contiguous() const {
+        if (is_contiguous()) {
+            return *this;
+        }
+
+        Self result(this->shape(), this->device());
+        copy_strided(*this, result.data());
+
+        return result;
+    }
+    Tensor<T> slice(size_t dim, size_t start, size_t end) const {
+        if (dim >= shape().size())
+            throw std::out_of_range("slice: dimension out of range");
+        if (start > end || end > shape()[dim])
+            throw std::out_of_range("slice: invalid range");
+        if (start == 0 && end == shape()[dim])
+            return *this;   // no-op
+
+        std::vector<size_t> new_shape = shape();
+        new_shape[dim] = end - start;
+
+        // strides remain the same, offset advanced by start * stride[dim]
+        size_t new_offset = offset() + start * strides()[dim];
+
+        auto new_impl = std::make_shared<TensorImpl<T>>(
+            impl_->storage_,
+            std::move(new_shape),
+            strides(),
+            new_offset
+        );
+        return Tensor<T>(new_impl);
+    }
 
     bool empty() const noexcept { return impl_ == nullptr || total_elements() == 0; }
     const std::vector<size_t>& shape() const noexcept { return impl_->shape_; }

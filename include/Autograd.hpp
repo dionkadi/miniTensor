@@ -431,9 +431,10 @@ struct MaxPool2DBackward : public AutogradNode<T> {
     void apply(const Tensor<T>& grad_output) override {
         NoGradGuard guard;
         Tensor<T> input = saved_input.unpack();
+        auto go = grad_output.contiguous();
         if (input.requires_grad()) {
             Tensor<T> grad_input(input.shape(), input.device());
-            max_pool2d_backward(grad_output, grad_input, indices);
+            max_pool2d_backward(go, grad_input, indices);
             input.accumulate_grad(grad_input);
         }
     }
@@ -459,21 +460,24 @@ struct Conv2DBackward : public AutogradNode<T> {
         Tensor<T> weight    = saved_weight.unpack();
         Tensor<T> bias      = saved_bias.unpack();
 
+        auto go = grad_output.contiguous();
+        auto in = input.contiguous();
+
         if (input.requires_grad()) {
             Tensor<T> grad_input(input.shape(), input.device());
-            conv2d_backward_input(grad_output, weight, grad_input, stride, padding);
+            conv2d_backward_input(go, weight, grad_input, stride, padding);
             input.accumulate_grad(grad_input);
         }
 
         if (weight.requires_grad()) {
             Tensor<T> grad_weight(weight.shape(), weight.device());
-            conv2d_backward_weight(grad_output, input, grad_weight, stride, padding);
+            conv2d_backward_weight(go, in, grad_weight, stride, padding);
             weight.accumulate_grad(grad_weight);
         }
 
         if (bias.requires_grad()) {
             Tensor<T> grad_bias(bias.shape(), bias.device());
-            conv2d_backward_bias(grad_output, grad_bias);
+            conv2d_backward_bias(go, grad_bias);
             bias.accumulate_grad(grad_bias);
         }
     }

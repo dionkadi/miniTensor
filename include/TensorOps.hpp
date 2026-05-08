@@ -44,6 +44,11 @@ template<typename T> struct ReLUGradOp {
 template<typename T> struct SigmoidOp { HD_INLINE T operator()(T a) const { return (T)1.0 / ((T)1.0 + exp(-a)); } };
 template<typename T> struct TanhOp { HD_INLINE T operator()(T a) const { return tanh(a); } };
 
+template<typename T> 
+struct IdentityOp { 
+    HD_INLINE T operator()(T a) const { return a; } 
+};
+
 // #######################################################
 // #   Generic CPU Execution Engine
 // #######################################################
@@ -503,6 +508,144 @@ void max_pool2d_backward_cpu(const Tensor<T>& grad_output, Tensor<T>& grad_input
     }
 }
 
+template<typename T>
+void copy_cpu_strided(const Tensor<T> src, T* dst) {
+    size_t total_elements = src.total_elements();
+
+    const T *src_ptr = src.data() + src.offset();
+
+    const auto& shape = src.shape();
+    const auto& strides = src.strides();
+    int ndims = shape.size();
+    
+    for (size_t i = 0; i < total_elements; ++i) {
+        size_t linear_idx = i;
+        size_t src_phys_idx = 0;
+        
+        for (int d = ndims - 1; d >= 0; --d) {
+            size_t coord = linear_idx % shape[d];
+            linear_idx /= shape[d];
+            src_phys_idx += coord * strides[d];
+        }
+        
+        dst[i] = src_ptr[src_phys_idx];
+    }
+}
+
+template <typename T>
+Tensor<T> stack(const std::vector<Tensor<T>>& tensors, size_t dim) {
+    if (tensors.empty())
+        throw std::invalid_argument("stack: empty tensor list");
+
+    const auto& first_shape = tensors[0].shape();
+    for (size_t i = 1; i < tensors.size(); ++i) {
+        if (tensors[i].shape() != first_shape)
+            throw std::invalid_argument("stack: all tensors must have same shape");
+    }
+
+    // New shape: insert a dimension of size N at position `dim`
+    size_t N = tensors.size();
+    auto out_shape = first_shape;
+    out_shape.insert(out_shape.begin() + dim, N);
+
+    Device dev = tensors[0].device();
+    Tensor<T> result(out_shape, dev);
+
+    // For each input, copy its entire data into the appropriate slice of result
+    for (size_t i = 0; i < N; ++i) {
+        auto out_slice = result.slice(dim, i, i + 1);   // shape with 1 at `dim`
+        // out_slice is a view; we need to copy the input's values into it.
+        // Make both contiguous to use a simple copy, or use copy_strided.
+        auto in_contig = tensors[i].contiguous();
+
+        size_t num_elements = in_contig.total_elements();
+        size_t bytes = num_elements * sizeof(T);
+
+        if (out_slice.is_contiguous()) {
+            if (dev.type == DeviceType::CPU) {
+                std::copy(in_contig.data() + in_contig.offset(), in_contig.data() + in_contig.offset() + num_elements, out_slice.data() + out_slice.offset());
+            } else {
+    #if defined(USE_CUDA)
+                GPU_CHECK(cudaMemcpy(out_slice.data() + out_slice.offset(), in_contig.data() + in_contig.offset(), bytes, cudaMemcpyDeviceToDevice));
+    #elif defined(USE_ROCM)
+                GPU_CHECK(hipMemcpy(out_slice.data() + out_slice.offset(), in_contig.data() + in_contig.offset(), bytes, hipMemcpyDeviceToDevice));
+    #else
+                throw std::runtime_error("GPU not supported");
+    #endif
+            }
+        } else {
+            if (dev.type == DeviceType::CPU) {
+                unary_cpu_strided(in_contig, out_slice, IdentityOp<T>{});
+            } else {
+#if defined(USE_CUDA) || defined(USE_ROCM)
+                unary_gpu_strided(in_contig, out_slice, IdentityOp<T>{});
+#endif
+            }
+        }
+
+    }
+    return result;
+}
+
+template <typename T>
+Tensor<T> concat(const std::vector<Tensor<T>>& tensors, size_t dim) {
+    if (tensors.empty()) throw std::invalid_argument("concat: empty list");
+    const auto& first_shape = tensors[0].shape();
+    size_t ndim = first_shape.size();
+    for (const auto& t : tensors) {
+        if (t.shape().size() != ndim)
+            throw std::invalid_argument("concat: tensors must have same number of dimensions");
+    }
+    // verify other dims equal
+    std::vector<size_t> out_shape = first_shape;
+    out_shape[dim] = 0;
+    for (const auto& t : tensors) {
+        for (size_t d = 0; d < ndim; ++d) {
+            if (d == dim)
+                out_shape[d] += t.shape()[d];
+            else if (t.shape()[d] != out_shape[d])
+                throw std::invalid_argument("concat: shape mismatch");
+        }
+    }
+
+    Device dev = tensors[0].device();
+    Tensor<T> result(out_shape, dev);
+    size_t offset = 0;
+
+    for (const auto& t : tensors) {
+        auto slice = result.slice(dim, offset, offset + t.shape()[dim]);
+        auto contig_t = t.contiguous();
+
+        size_t num_elements = contig_t.total_elements();
+        size_t bytes = num_elements * sizeof(T);
+
+        if (slice.is_contiguous()) {
+            if (dev.type == DeviceType::CPU) {
+                std::copy(contig_t.data() + contig_t.offset(), contig_t.data() + contig_t.offset() + num_elements, slice.data() + slice.offset());
+            } else {
+    #if defined(USE_CUDA)
+                GPU_CHECK(cudaMemcpy(slice.data() + slice.offset(), contig_t.data() + contig_t.offset(), bytes, cudaMemcpyDeviceToDevice));
+    #elif defined(USE_ROCM)
+                GPU_CHECK(hipMemcpy(slice.data() + slice.offset(), contig_t.data() + contig_t.offset(), bytes, hipMemcpyDeviceToDevice));
+    #else
+                throw std::runtime_error("GPU not supported");
+    #endif
+            }
+        } else {
+            if (dev.type == DeviceType::CPU) {
+                unary_cpu_strided(contig_t, slice, IdentityOp<T>{});
+            } else {
+#if defined(USE_CUDA) || defined(USE_ROCM)
+                unary_gpu_strided(contig_t, slice, IdentityOp<T>{});
+#endif
+            }
+        }
+
+        offset += t.shape()[dim];
+    }
+    return result;
+}
+
 // #######################################################
 // #   Generic GPU Declarations
 // #######################################################
@@ -524,6 +667,7 @@ template<typename T> std::pair<Tensor<T>, std::vector<size_t>> max_pool2d_gpu(co
 template<typename T> std::pair<Tensor<T>, std::vector<size_t>> max_pool2d_gpu_strided(const Tensor<T>& input, size_t k, size_t stride, size_t padding);
 template<typename T> void max_pool2d_backward_gpu(const Tensor<T>& grad_output, Tensor<T>& grad_input, const std::vector<size_t>& h_indices);
 template<typename T> void max_pool2d_backward_gpu_strided(const Tensor<T>& grad_output, Tensor<T>& grad_input, const std::vector<size_t>& h_indices);
+template<typename T> void copy_gpu_strided(const Tensor<T> src, T* dst);
 #endif
 
 // #############################
@@ -952,6 +1096,19 @@ Tensor<T> sigmoid(const Tensor<T>& A) {
 template<typename T> 
 Tensor<T> tanh(const Tensor<T>& A) { 
     return dispatch_unary<T, TanhOp<T>, TanhBackward<T>>(A, TanhOp<T>{}); 
+}
+
+template<typename T> 
+void copy_strided(const Tensor<T> src, T* dst) {
+    if (src.device() == DeviceType::CPU) {
+        copy_cpu_strided(src, dst);
+    } else {
+#if defined(USE_CUDA) || defined(USE_ROCM)
+        copy_gpu_strided(src, dst);
+#else
+        throw std::runtime_error("Library was not compiled with GPU support!");
+#endif
+    }
 }
 
 // #############################
