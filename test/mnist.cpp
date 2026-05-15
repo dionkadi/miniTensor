@@ -11,6 +11,8 @@
 #include <iostream>
 #include <chrono>
 #include <iomanip>
+#include <thread>
+#include <future>
 
 template<typename T>
 class MNISTDataset : public Dataset<T> {
@@ -175,22 +177,57 @@ int main() {
     for (int epoch = 0; epoch < epochs; ++epoch) {
         T running_loss = 0;
         size_t batches = 0;
-        auto start = std::chrono::high_resolution_clock::now();
+        auto epoch_start = std::chrono::high_resolution_clock::now();
 
-        for (auto [batch_x, batch_y] : train_loader) {
-            batch_x = batch_x.to(gpu);
-            batch_y = batch_y.to(gpu);
+        // Double-buffer: pre-load first batch onto GPU, then in each
+        // iteration launch GPU kernels for the current batch and
+        // construct the NEXT batch's CPU tensor (slice+concat) before
+        // the sync point — overlapping CPU work with GPU compute.
+        auto it = train_loader.begin();
+        auto end_it = train_loader.end();
+        {
+            auto [bx, by] = *it;
+            Tensor<T> gpu_bx = bx.to(gpu);
+            Tensor<T> gpu_by = by.to(gpu);
+            ++it;
+
+            while (it != end_it) {
+                optimizer.zero_grad();
+                auto pred = model->forward(gpu_bx);
+                auto loss = cross_entropy(pred, gpu_by);
+                loss.backward();
+                optimizer.step();
+
+                // Next batch's CPU construction runs WHILE GPU executes
+                // the kernels above (async default stream).
+                auto [next_x, next_y] = *it;
+                ++it;
+
+                // loss.to(cpu) syncs: hipMemcpy(D2H) blocks until GPU done
+                running_loss += loss.to({DeviceType::CPU}).data()[0];
+                ++batches;
+
+                gpu_bx = next_x.to(gpu);
+                gpu_by = next_y.to(gpu);
+
+                if (batches % 200 == 0) {
+                    std::cerr << "  batch " << batches
+                              << " avg_loss=" << running_loss / batches
+                              << std::endl;
+                }
+            }
 
             optimizer.zero_grad();
-            auto pred = model->forward(batch_x);
-            auto loss = cross_entropy(pred, batch_y);
+            auto pred = model->forward(gpu_bx);
+            auto loss = cross_entropy(pred, gpu_by);
             loss.backward();
             optimizer.step();
-
             running_loss += loss.to({DeviceType::CPU}).data()[0];
             ++batches;
             if (batches % 200 == 0) {
-                std::cerr << "  batch " << batches << " avg_loss=" << running_loss / batches << std::endl;
+                std::cerr << "  batch " << batches
+                          << " avg_loss=" << running_loss / batches
+                          << std::endl;
             }
         }
 
@@ -210,7 +247,6 @@ int main() {
                 auto loss = cross_entropy(pred, batch_y);
 
                 test_loss_sum += loss.to({DeviceType::CPU}).data()[0];
-                // Copy to CPU before computing accuracy
                 test_acc_sum += compute_accuracy(pred.to({DeviceType::CPU}), batch_y.to({DeviceType::CPU}));
                 ++test_batches;
             }
@@ -220,7 +256,7 @@ int main() {
         T avg_test_acc = test_acc_sum / test_batches;
 
         auto end = std::chrono::high_resolution_clock::now();
-        double sec = std::chrono::duration<double>(end - start).count();
+        double sec = std::chrono::duration<double>(end - epoch_start).count();
 
         std::cout << "Epoch " << epoch + 1 << "/" << epochs
                   << " | train loss: " << running_loss / batches
