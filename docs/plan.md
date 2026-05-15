@@ -85,3 +85,4 @@ If I were you, I would tackle **Phase 1 (`nn::Module`)** today. It is entirely a
 
 Epoch 1/5 | train loss: 0.1092 | test loss: 0.0433 | test acc: 98.70% | time: 1554.82s
 Epoch 1/5 | train loss: 0.0930 | test loss: 0.0315 | test acc: 99.00% | time: 1405.93s
+Epoch 1/5 | train loss: 0.1099 | test loss: 0.0340 | test acc: 98.82% | time: 1366.51s

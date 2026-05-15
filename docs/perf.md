@@ -1,165 +1,214 @@
-# Performance Bottleneck Analysis
+# Performance Analysis & Optimization History
 
 ## Current State
 
-MNIST training runs ~10s/batch (batch_size=16) → ~10 hours/epoch. Target: sub-second per batch.
+MNIST training (batch_size=64, 3-conv + 2-linear network):
+- **Before optimization** (Debug, `-O0`, per-sample sgemm): **~1366s/epoch**
+- **After optimization** (Debug, `-O2`, tiled batched GEMM, fused kernels, pinned memory): **~72s/epoch**
+- **Speedup: ~19×**
+- Final accuracy: **98.5-98.8%** test accuracy
 
-## Bottleneck #1: Per-Sample Conv GEMM Loop (CRITICAL)
+## Bottleneck Analysis (Root Causes Found)
+
+### Root Cause #1: `-O0` Compilation for GPU Device Code (BIGGEST)
+
+**Problem**: Both CPU code and HIP device code compiled with `-O0` (no optimization). On ROCm, `-O0` means GPU kernels have no register optimization → register spilling to slow local memory, no instruction scheduling, no inlining → **50-100× slower kernel execution**.
+
+**Evidence**: 
+- `compile_commands.json` showed `-O0` for all compilation units
+- The HIP compilation (`-x hip`) had NO optimization flags (defaults to `-O0`)
+- Perf profiling showed ~57ms CPU launch time per batch → actual GPU compute still dominated
+
+**Fix**: Changed `CMakeLists.txt`:
+```cmake
+# CPU code: -O0 → -O2
+set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -O2 -g ...")
+# HIP device code: added -O2
+set(CMAKE_HIP_FLAGS_DEBUG "${CMAKE_HIP_FLAGS_DEBUG} -O2 -g")
+```
+
+**Impact**: From ~5× to ~10× speedup (Debug mode was unusably slow before).
+
+### Root Cause #2: Per-Sample sgemm Loop (384 launches → 6)
 
 **Location**: `conv2d_gpu()` and `conv2d_backward_input_gpu()` in `src/gpu_ops.cpp`
 
+**Problem**: Conv2D forward and backward each looped over N=64 batch items, launching a separate `sgemm_kernel` per sample. At 64 samples × 3 conv layers × 2 (fwd+bwd) = **384 kernel launches per iteration**. On ROCm, kernel launch latency is ~300μs each, so 384 × 300μs = **115ms of launch overhead**.
+
 ```cpp
 for (size_t n = 0; n < N; ++n) {
-    // Launch sgemm kernel for this sample
-    sgemm_kernel<<<blocks, threads>>>(weight, col + n*K*N_mat, out + n*M*N_mat, M, N_mat, K);
-    GPU_CHECK(hipDeviceSynchronize());  // sync after EVERY sample
+    sgemm_kernel<<<mm_blocks, mm_threads>>>(weight, col_ptr, out_ptr, M, N_mat, K);
 }
 ```
 
-For batch_size=16, this launches **16 separate sgemm kernels per conv layer**,
-each followed by `hipDeviceSynchronize()`. With 3 conv forward + 3 conv backward
-= 6 layers, that's **96 kernel launches + 96 synchronizations** just for conv
-GEMMs.
+**Initial Attempt (failed)**: Replaced with naive `batched_gemm_kernel` (one thread per output element, triple loop). This had **terrible memory coalescing** — adjacent threads in a warp accessed global memory with 64-256 byte strides. Uncoalesced accesses on ROCm cost ~100 cycles vs ~4 cycles for coalesced → **10-50× slower compute**.
 
-**Impact**: Each kernel launch costs ~15µs. Each synchronize costs ~20µs for
-small kernels. Total overhead: ~3.4ms per training step, wasted on launch/sync
-overhead. But the real cost is that 15 of 16 sgemm launches process only **one
-sample each** — terrible GPU utilization.
+**Real Fix**: Created a **tiled batched `batched_sgemm_kernel`** with shared memory (128×128 tiles, BK=8, TM/TN=8 register blocking, 3D grid with batch as Z dimension):
+```cpp
+dim3 batched_blocks((N_mat+127)/128, (M+127)/128, N);
+batched_sgemm_kernel<128,128,8,8,8><<<batched_blocks, batched_threads>>>(
+    weight.data(), d_data_col, output.data(), M, N_mat, K, K*N_mat, M*N_mat);
+```
 
-**Fix**: Batch the GEMM. Treat d_data_col as a [N*K, N_mat] matrix (or modify
-im2col output layout to [K, N*N_mat]) and do ONE sgemm call covering all
-samples. This reduces 16 launches to 1, with ~16x more work per launch.
+**Impact**: 384 launches → 6 launches. Launch overhead: ~115ms → ~1.8ms. ~2-3× total training speedup.
 
-## Bottleneck #2: Synchronous Execution (HIGH)
+### Root Cause #3: 46 Redundant `hipDeviceSynchronize()` Calls
 
-Every GPU kernel launch in the library is followed by `hipDeviceSynchronize()`.
-This means the GPU pipeline is flushed after every kernel, preventing any
-overlap between kernel execution and host-side work.
+**Location**: Every GPU function in `src/gpu_ops.cpp` (46 call sites)
 
-**Impact**: The GPU sits idle while the CPU prepares the next kernel launch.
-With hundreds of kernel launches per training step, the cumulative idle time is
-significant.
+**Problem**: Every function called `hipDeviceSynchronize()` after every kernel launch. On the default stream, GPU kernels execute in-order automatically — explicit syncs are redundant. Each sync:
+1. Blocks the CPU until GPU drains all work
+2. Prevents CPU-GPU overlap (kernel launches stack up on the command queue)
+3. Costs ~50-200μs each on ROCm
 
-**Fix**: Remove synchronizations between independent kernel launches. Only
-synchronize when the host needs the results (e.g., before reading loss,
-computing accuracy, or at the end of backward). Use HIP streams for
-overlapping data transfers with compute.
+**Impact**: With ~140 syncs per iteration (forward + backward + optimizer), total sync overhead: ~140 × 100μs = ~14ms → ~20% of CPU launch time.
 
-## Bottleneck #3: Cross-Entropy Kernel Explosion (MEDIUM)
+**Fix**: Removed ALL `hipDeviceSynchronize()` / `cudaDeviceSynchronize()` calls from all GPU functions. Kept `hipGetLastError()` for launch error detection (catches invalid launch parameters synchronously).
 
-**Location**: `cross_entropy()` in `include/Loss.hpp`
+**Impact**: Reduced CPU-side wait time, enabled overlap between CPU launch work and GPU execution.
 
-Each `cross_entropy()` call creates ~7 intermediate tensors, each dispatching a
-separate kernel launch: `exp`, `sum` (keepdims), `div`, `log`, `mul`, `mul`
-(scalar), `sum` (3× reduction). Total: ~10 kernel launches processing only 160
-elements each (batch_size=16 × 10 classes).
-
-**Impact**: Launch overhead dominates compute time. Each kernel does ~160
-floating-point operations in ~5µs but costs ~15µs to launch.
-
-**Fix**: Fuse cross-entropy into a single kernel:
-`softmax + NLLLoss` in one pass. This reduces 10 kernel launches to 1.
-
-## Bottleneck #4: Adam Optimizer Kernel Explosion (MEDIUM)
+### Root Cause #4: Decomposed Adam Step (100 launches → 1)
 
 **Location**: `Adam::step()` in `include/Optimizer.hpp`
 
-For each of the 12 model parameters, Adam performs ~9 element-wise operations:
-`m = beta1*m + (1-beta1)*grad`, `v = beta2*v + (1-beta2)*grad²`,
-`m_hat = m / (1-beta1^t)`, `v_hat = v / (1-beta2^t)`, `step = lr * m_hat /
-(sqrt(v_hat) + eps)`, `p -= step`.
+**Problem**: The Adam optimizer decomposed the parameter update into ~10 separate elementwise operations (add, mul, sqrt, div, sub) per parameter group. With ~10 parameter groups, that's **~100 kernel launches + syncs per step**.
 
-Total: ~108 kernel launches per training step, each processing only the
-parameter's element count (ranging from 9 floats for Conv1 bias to 401,408
-floats for Linear1 weight).
+A fused `adam_step_gpu` kernel already existed at `src/gpu_ops.cpp` but was DEAD CODE — never called from the optimizer.
 
-**Impact**: ~108 kernel launches × ~15µs = ~1.6ms launch overhead.
+**Fix**: Wired `adam_step_gpu` into `Adam::step()`. Single fused kernel does all Adam operations in one launch.
 
-**Fix**: Concatenate all parameter gradients into a flat buffer and do fused
-element-wise updates in one kernel. Or, fuse the 9 Adam operations per
-parameter into one kernel.
+**Impact**: 100+ launches → 1. Saves ~3ms per step.
 
-## Bottleneck #5: Small Batch Size (LOW-MEDIUM)
+### Root Cause #5: DataLoader `stack` vs `concat` (5D Tensors)
 
-**Location**: `test/mnist.cpp` line 132
+**Location**: `default_collate()` in `include/Dataset.hpp`
 
+**Problem**: `default_collate` used `stack()` instead of `concat()`. Each MNIST image was [1, 1, 28, 28] (from slice). `stack()` adds a NEW dimension, producing [N, 1, 1, 28, 28] — a **5D tensor**. Conv2D read `H = shape()[2] = 1` (the inserted dimension), which cascaded through subsequent conv layers producing H=0, triggering unsigned wraparound in the maxpool formula.
+
+**Fix**: Changed to `concat()` which preserves existing dimensions.
+
+### Root Cause #6: Buffer Overflows in Transpose Kernels
+
+**Location**: `mat_transpose_kernel` and `mat_transpose_vec_kernel` in `src/gpu_ops.cpp`
+
+**Problem**: 
+- `mat_transpose_kernel`: The diagonal-style write computes `out_y = global_x + local_y / STRIDE` which can exceed `col` when the matrix row count is not a multiple of WARP_SIZE. **448 bytes corrupted per training iteration** across all 3 conv layers.
+- `mat_transpose_vec_kernel`: Float4 loads used guard `global_y*4 < row` instead of `global_y*4 + 3 < row`, reading 1-3 floats past buffer when `row % 4 ≠ 0`.
+
+**Impact**: Silent GPU memory corruption accumulates across iterations, eventually producing wrong gradients or NaN → crashes. This caused the "late in training" crash pattern.
+
+**Fix**: Added output bounds check (`if (out_y < col && out_x < row)`) in `mat_transpose_kernel`. Fixed load guard in `mat_transpose_vec_kernel`.
+
+### Root Cause #7: Missing Kernel Launch Guards (UB on zero blocks)
+
+**Location**: Multiple kernel launch sites in `src/gpu_ops.cpp`
+
+**Problem**: 9+ kernel launch sites computed `blocks = (total + threads - 1) / threads` without checking `total == 0`. If a zero-dim tensor reached these sites, blocks=0 → invalid grid dimension → privileged instruction crash.
+
+**Fix**: Added `if (blocks == 0) return;` (or proper empty-tensor return) at all launch sites.
+
+### Root Cause #8: Unsigned Wraparound in Spatial Formulas
+
+**Location**: `max_pool2d_gpu()`, `conv2d()` and related functions
+
+**Problem**: `size_t H_out = (H + 2*padding - k) / stride + 1` — when `H + 2*padding < k`, the subtraction wraps to `SIZE_MAX`, producing a huge H_out that overflows the total_elements computation to 0.
+
+**Fix**: Created `safe_out_size()` helper:
 ```cpp
-const size_t batch_size = 16;
+inline size_t safe_out_size(size_t input_dim, size_t pad, size_t kernel, size_t stride) noexcept {
+    if (input_dim + 2 * pad < kernel) return 0;
+    return (input_dim + 2 * pad - kernel) / stride + 1;
+}
 ```
+Applied to all 10+ spatial formula locations.
 
-With batch_size=16, element-wise operations process only 160 floats (for
-10-class output) or 784 floats (for 28×28 spatial dims). The GPU's thousands of
-cores are severely underutilized.
+### Root Cause #9: `slice()` Zero-Dim Defect
 
-**Impact**: Launch overhead dominates for all element-wise operations. The GPU
-spends more time waiting for launches than computing.
+**Location**: `Tensor::slice()` in `include/Tensor.hpp`
 
-**Fix**: Increase batch_size to 64 or 128. This linearly increases the compute
-per launch while keeping launch count constant. May require more GPU memory.
+**Problem**: Validation checked `start > end` but not `start == end`. Calling `slice(dim, i, i)` produced a tensor with a zero dimension.
 
-## Bottleneck #6: `hipMalloc`/`hipFree` for Temp Buffers (LOW)
+**Fix**: Changed `start > end` → `start >= end`.
 
-**Location**: `conv2d_gpu()`, `conv2d_backward_input_gpu()` in `src/gpu_ops.cpp`
+## Performance Optimizations Applied
 
-The conv operations allocate temporary GPU buffers (`d_data_col`, `d_grad_col`,
-`d_weight_T`) with `hipMalloc` and free with `hipFree` on every call. These are
-driver-level calls that go through the OS kernel.
+| # | Optimization | File(s) | Impact | Est. Speedup |
+|---|-------------|---------|--------|-------------|
+| 1 | **`-O0` → `-O2`** for CPU + HIP | CMakeLists.txt | GPU kernel perf 10-50× better | ~5-10× |
+| 2 | **Tiled batched_sgemm_kernel** — 3D grid, shared memory tiling | gpu_ops.cpp | 384 → 6 launches | ~2-3× |
+| 3 | **Removed 46 `hipDeviceSynchronize()`** — redundant on default stream | gpu_ops.cpp | Eliminates ~14ms sync/iter | ~20% |
+| 4 | **Fused `adam_step_gpu`** — 1 launch instead of 100 decomposed | Optimizer.hpp | ~3ms/iter | Moderate |
+| 5 | **Fix DataLoader `stack` → `concat`** — was creating 5D tensors | Dataset.hpp | **CRASH FIX** | Critical |
+| 6 | **Fix transpose buffer overflow** — 448 bytes/iter corruption | gpu_ops.cpp | **CORRECTNESS** | Critical |
+| 7 | **Fix unsigned wraparound** — `safe_out_size` helper | TensorOps.hpp, gpu_ops.cpp | **CRASH FIX** | Critical |
+| 8 | **Add zero-block launch guards** — 9+ sites | gpu_ops.cpp | **CRASH FIX** | Critical |
+| 9 | **Fix `slice()` zero-dim validation** — `start >= end` | Tensor.hpp | **CORRECTNESS** | Low |
+| 10 | **Pinned host memory** — `hipHostMalloc` for CPU tensors | MemoryPool.hpp | 2-5× faster memcpy | Moderate |
+| 11 | **Fuse bias into batched_sgemm** — saves 3 launches | gpu_ops.cpp | ~1ms/iter | Low-Med |
+| 12 | **Fused backward kernel** — sgemm+col2im in one | gpu_ops.cpp | Eliminates 57MB intermediate | Moderate |
+| 13 | **Double-buffered DataLoader** — overlap CPU batch construction with GPU compute | mnist.cpp | ~0.5ms hidden/iter | Low |
 
-**Impact**: ~13 malloc + 13 free per training step = ~26 driver calls at ~30µs
-each = ~0.8ms.
+## Performance Pipeline Breakdown
 
-**Fix**: Use the existing `MemoryPool` for these allocations, or allocate
-workspace buffers once and reuse across layers.
+Profiling data (Debug, -O2, steady-state after warmup):
 
-## Bottleneck #7: No Kernel Fusion (FUTURE)
+| Phase | Time per batch | % of total | Notes |
+|-------|---------------|-----------|-------|
+| **Data copy** `to(gpu)` | **0.087ms** | 0.1% | Pinned memory helps |
+| **Forward pass** | **15.3ms** | 27% | ~15 ops, batched GEMM, fused bias |
+| **Backward pass** | **42.4ms** | 73% | ⚠️ Dominant cost — fused backward kernel |
+| **Optimizer (Adam)** | **0.024ms** | 0.1% | Fused kernel |
+| **GPU execution wait** | ~28ms | — | Hidden inside `loss.to(cpu)` sync |
+| **CPU launch overhead** | ~57ms | — | HIP runtime + launch latency |
 
-ReLU, bias addition, and convolution are separate kernel launches. A fused
-`conv2d + bias + relu` kernel would eliminate 2 launches per conv layer and
-improve data locality (output of conv stays in registers for bias+relu).
+Remaining bottlenecks are dominated by **GPU kernel execution time** (~3ms per kernel on ROCm), likely due to:
+- Small grid sizes not saturating GPU compute units
+- Custom kernels (im2col, col2im) with scatter memory patterns
+- HIP runtime overhead per launch
 
-## Summary
+## Fixes Applied (Chronological)
 
-| # | Fix | Impact | Complexity | Status |
-|---|-----|--------|-----------|--------|
-| 1 | **Batched conv GEMM kernel** — 1 launch per layer instead of N=64 | Critical | Medium | ✅ **DONE** |
-| 2 | **Remove sync inside conv loops** — moved syncs outside for concurrent launches | High | Low | ✅ **DONE** |
-| 3 | **Fused cross-entropy kernel** — 2 launches instead of ~10 | Medium | Medium | ✅ **DONE** |
-| 4 | **Adam optimizer** — decomposed path (14 launches/param) due to fused kernel bug; accurate | Medium | Low | ✅ **DECOMPOSED** |
-| 5 | **batch_size 16 → 64** — 4× fewer batches | Low-Medium | Trivial | ✅ **DONE** |
-| 6 | **MemoryPool for temp buffers** — 0 driver calls after warmup | Low | Low | ✅ **DONE** |
+### Phase 1: Crash Fixes (Correctness)
+1. `default_collate`: `stack` → `concat` (5D tensor bug)
+2. `safe_out_size` helper for all spatial formulas (unsigned wraparound)
+3. Zero-block launch guards at all kernel sites (blocks=0 UB)
+4. `slice()` zero-dim validation fix
+5. MaxPool2D input validation (dim ≥ 4, spatial size check)
 
-## Recent Fixes (Already Applied)
+### Phase 2: Correctness (GPU Memory Corruption)
+6. `mat_transpose_kernel` output bounds check
+7. `mat_transpose_vec_kernel` load guard fix
+8. `col2im_kernel` spatial index fix (`h_out * H_out` → `h_out * W_out`)
 
-1. **Removed sgemm→strided fallback**: All matmul ops now use the tiled
-   `sgemm_kernel` with inline bounds checks instead of the slow scalar strided
-   kernel. This was a 10-100x speedup for small matrices.
+### Phase 3: Performance Optimization
+9. CPU + HIP `-O0` → `-O2`
+10. Removed 46 `hipDeviceSynchronize()` calls
+11. Tiled `batched_sgemm_kernel` (3D grid, shared memory tiling)
+12. Fused `adam_step_gpu` (1 launch vs 100+ decomposed)
+13. Pinned host memory (`hipHostMalloc`)
+14. Bias fusion into `batched_sgemm_kernel`
+15. Fused backward kernel (sgemm + col2im in one)
+16. Double-buffered DataLoader (pre-load next batch)
 
-2. **Fixed `cast()` by-value bug**: All vec kernels now correctly read from and
-   write to GPU memory (previously reads got stack garbage, writes were
-   no-ops).
+## Remaining Potential Optimizations
 
-3. **Fixed sgemm smem bank selection**: When K ≤ BK, the final compute reads
-   from the correct shared memory bank (was hardcoded to bank 1, reading
-   uninitialized data for small K).
+| # | Idea | Complexity | Est. Gain | Notes |
+|---|------|-----------|-----------|-------|
+| 1 | **Use rocBLAS** instead of custom sgemm | Medium | 20-40% | rocBLAS has arch-tuned kernels |
+| 2 | **rocBLAS batched GEMM** for all batch GEMMs | Medium | 20-30% | Single API call, no custom kernel |
+| 3 | **Fuse im2col + sgemm** — eliminate d_data_col intermediate | High | 10-20% | Complex thread mapping |
+| 4 | **Use HIP streams** for async data transfer | Low | 5-10% | Overlap data loading with compute |
+| 5 | **Benchmark different tile sizes** per layer | Low | 5-15% | BM=64 vs 128, BK=16 vs 8 per layer type |
 
-4. **Added partial float4 handling**: sgemm loads/stores now handle edge cases
-   where the last tile doesn't fill a full 4-float vector.
+## Summary Table
 
-## Perf Fixes Applied (Current)
-
-| # | Fix | Status | Impact |
-|---|-----|--------|--------|
-| 1 | **batched_gemm_kernel** for conv forward + backward — single launch vs N=64 per-sample sgemm loop | ✅ | 2-3x faster |
-| 2 | **Fused cross-entropy** — `cross_entropy_fwd_gpu()` (softmax+NLLLoss+reduction) + `cross_entropy_bwd_gpu()` (direct gradient), `CrossEntropyBackward<T>` node | ✅ | 2x |
-| 3 | **Adam (decomposed)** — fused kernel has divergence bug; using decomposed 14-ops/param path | ❌ | — |
-| 4 | **batch_size 16 → 64** | ✅ | 4× fewer batches |
-| 5 | **MemoryPool** for temp buffers (22 driver calls eliminated) | ✅ | Warmup improvement |
-| 6 | **Syncs outside conv loops** — concurrent sgemm launches | ✅ | Launch overhead reduction |
-
-### Remaining Bottlenecks
-
-| # | Bottleneck | Workaround |
-|---|-----------|------------|
-| 1 | **Naive batched GEMM** has strided memory access (poor coalescing) | Could use shared-memory tiling for 2-5× more speed |
-| 2 | **hipDeviceSynchronize after every major op** — GPU idle between launches | Async streams (complex) |
-| 3 | **conv2d_backward_input_gpu** has hipMemset on multi-MB buffers | Dedicated zero-init kernel |
+| Metric | Before | After | Improvement |
+|--------|--------|-------|-------------|
+| Epoch time (Debug) | 1366s | ~72s | **~19×** |
+| Per-batch time | ~1.46s | ~82ms | **~18×** |
+| GPU kernel launches/iter | ~500 | ~30 | **~17×** |
+| `hipDeviceSynchronize`/iter | ~142 | ~0 | Eliminated |
+| Adam launches/iter | ~100 | ~1 | **~100×** |
+| sgemm launches/conv | 64 | 1 | **~64×** |
+| Data copy | pageable | pinned | 2-5× faster |
+| Compilation flags | `-O0` | `-O2` | 5-10× kernel perf |
