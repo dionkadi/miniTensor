@@ -18,7 +18,7 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
 endif()
 
 set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -Wall -Wextra -Werror")
-set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -O0 -g -fno-omit-frame-pointer -fno-optimize-sibling-calls")
+set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -O2 -g -fno-omit-frame-pointer -fno-optimize-sibling-calls")
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 # Define options for the user, defaulting to OFF
@@ -63,10 +63,10 @@ add_executable(tensor_tests
     # test/tensor_test.cpp
     # test/spatial_test.cpp
     # test/engien_test.cpp
-    test/nn_test.cpp
+    # test/nn_test.cpp
     # test/func_test.cpp
     # test/dataset_test.cpp
-    # test/mnist.cpp
+    test/mnist.cpp
 )
 target_include_directories(tensor_tests PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 
@@ -82,6 +82,7 @@ if(USE_CUDA)
 elseif(USE_ROCM)
     enable_language(HIP)
     target_compile_definitions(tensor PUBLIC -DUSE_ROCM -D__HIP_PLATFORM_AMD__)
+    set(CMAKE_HIP_FLAGS_DEBUG "${CMAKE_HIP_FLAGS_DEBUG} -O3 -g")
     set_source_files_properties(
         src/gpu_ops.cpp 
         test/tensor_test.cpp 
