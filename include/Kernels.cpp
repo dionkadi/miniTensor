@@ -873,7 +873,7 @@ __global__ void col2im_kernel(
             int w_k = (w + pad) - w_out * stride;
             
             int channel_idx = c * (kW * kH) + h_k * kW + w_k;
-            int spatial_out_idx = h_out * H_out + w_out;
+            int spatial_out_idx = h_out * W_out + w_out;
 
             int col_idx = batch_channel_offset + channel_idx * spatial_area + spatial_out_idx;
 
@@ -900,9 +900,9 @@ void unary_gpu(const Tensor<T>& A, Tensor<T>& C, Op op) {
     }
     
 #if defined(USE_CUDA)
-    GPU_CHECK(cudaGetLastError()); GPU_CHECK(cudaDeviceSynchronize());
+    GPU_CHECK(cudaGetLastError());
 #elif defined(USE_ROCM)
-    GPU_CHECK(hipGetLastError()); GPU_CHECK(hipDeviceSynchronize());
+    GPU_CHECK(hipGetLastError());
 #endif
 }
 
@@ -923,9 +923,9 @@ void binary_gpu(const Tensor<T>& A, const Tensor<T>& B, Tensor<T>& C, Op op) {
     }
     
 #if defined(USE_CUDA)
-    GPU_CHECK(cudaGetLastError()); GPU_CHECK(cudaDeviceSynchronize());
+    GPU_CHECK(cudaGetLastError());
 #elif defined(USE_ROCM)
-    GPU_CHECK(hipGetLastError()); GPU_CHECK(hipDeviceSynchronize());
+    GPU_CHECK(hipGetLastError());
 #endif
 }
 
@@ -955,9 +955,7 @@ void matmul_gpu(const Tensor<T>& A, const Tensor<T>& B, Tensor<T>& C) {
 
 #if defined(USE_CUDA)
     GPU_CHECK(cudaGetLastError());
-    GPU_CHECK(cudaDeviceSynchronize());
 #elif defined(USE_ROCM)
     GPU_CHECK(hipGetLastError());
-    GPU_CHECK(hipDeviceSynchronize());
 #endif
 }

@@ -48,8 +48,13 @@ public:
         // No free block found, make an expensive OS/Driver call
         void* ptr = nullptr;
         if (device.type == DeviceType::CPU) {
+#if defined(USE_CUDA) || defined(USE_ROCM)
+            // Use pinned (page-locked) memory for faster CPU↔GPU transfers
+            GPU_CHECK(hipHostMalloc(&ptr, bytes));
+#else
             ptr = std::malloc(bytes);
             if (!ptr) throw std::bad_alloc();
+#endif
         } else if (device.type == DeviceType::CUDA) {
 #if defined(USE_CUDA)
             GPU_CHECK(cudaMalloc(&ptr, bytes));
@@ -74,7 +79,11 @@ public:
         std::lock_guard<std::mutex> lock(mtx_);
         for (auto& pair : cpu_pool_) {
             for (void* ptr : pair.second) {
+#if defined(USE_CUDA) || defined(USE_ROCM)
+                (void)hipHostFree(ptr);
+#else
                 std::free(ptr);
+#endif
             }
         }
         cpu_pool_.clear();

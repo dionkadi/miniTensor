@@ -12,6 +12,12 @@
 #endif
 #endif
 
+// Prevent unsigned wraparound: returns 0 instead of SIZE_MAX when input + 2*pad < kernel
+inline size_t safe_out_size(size_t input_dim, size_t pad, size_t kernel, size_t stride) noexcept {
+    if (input_dim + 2 * pad < kernel) return 0;
+    return (input_dim + 2 * pad - kernel) / stride + 1;
+}
+
 // #######################################################
 // #   Functors
 // #######################################################
@@ -407,8 +413,8 @@ std::pair<Tensor<T>, std::vector<size_t>>   // output tensor + flat indices
 max_pool2d_cpu(const Tensor<T>& input, size_t k, size_t stride, size_t padding)
 {
     size_t N = input.shape()[0], C = input.shape()[1], H = input.shape()[2], W = input.shape()[3];
-    size_t H_out = (H + 2 * padding - k) / stride + 1;
-    size_t W_out = (W + 2 * padding - k) / stride + 1;
+    size_t H_out = safe_out_size(H, padding, k, stride);
+    size_t W_out = safe_out_size(W, padding, k, stride);
 
     Tensor<T> output({N, C, H_out, W_out}, input.device());
     std::vector<size_t> indices(N * C * H_out * W_out); // flat indices
@@ -453,8 +459,8 @@ std::pair<Tensor<T>, std::vector<size_t>>   // output tensor + flat indices
 max_pool2d_cpu_strided(const Tensor<T>& input, size_t k, size_t stride, size_t padding)
 {
     size_t N = input.shape()[0], C = input.shape()[1], H = input.shape()[2], W = input.shape()[3];
-    size_t H_out = (H + 2 * padding - k) / stride + 1;
-    size_t W_out = (W + 2 * padding - k) / stride + 1;
+    size_t H_out = safe_out_size(H, padding, k, stride);
+    size_t W_out = safe_out_size(W, padding, k, stride);
 
     Tensor<T> output({N, C, H_out, W_out}, input.device());
     std::vector<size_t> indices(N * C * H_out * W_out); // flat indices
@@ -959,8 +965,8 @@ Tensor<T> conv2d(const Tensor<T>& input, const Tensor<T>& weight, const Tensor<T
     
     size_t N = input.shape()[0], /* C_in = input.shape()[1] */ H = input.shape()[2], W = input.shape()[3];
     size_t C_out = weight.shape()[0], kH = weight.shape()[2], kW = weight.shape()[3];
-    size_t H_out = (H + 2 * padding - kH) / stride + 1;
-    size_t W_out = (W + 2 * padding - kW) / stride + 1;
+    size_t H_out = safe_out_size(H, padding, kH, stride);
+    size_t W_out = safe_out_size(W, padding, kW, stride);
 
     Tensor<T> output({N, C_out, H_out, W_out}, input.device());
 
@@ -1029,6 +1035,11 @@ void conv2d_backward_bias(const Tensor<T>& grad_output, Tensor<T>& grad_bias) {
 
 template<typename T>
 Tensor<T> max_pool2d(const Tensor<T>& input, size_t kernel_size, size_t stride, size_t padding) {
+    if (input.shape().size() < 4)
+        throw std::invalid_argument("max_pool2d: input must have at least 4 dims [N, C, H, W]");
+    size_t H = input.shape()[2], W = input.shape()[3];
+    if (H + 2 * padding < kernel_size || W + 2 * padding < kernel_size)
+        throw std::invalid_argument("max_pool2d: input spatial dims too small for kernel+padding");
     Tensor<T> output;
     std::vector<size_t> indices;
 

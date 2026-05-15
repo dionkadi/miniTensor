@@ -55,8 +55,8 @@ std::pair<Tensor<T>, Tensor<T>> default_collate(const std::vector<std::pair<Tens
         batch_labels.push_back(item.second);
     }
     
-    // Concat along dimension 0
-    return { stack(batch_features, 0), stack(batch_labels, 0) };
+    // Concat along dimension 0 (not stack — stack adds a new dimension)
+    return { concat(batch_features, 0), concat(batch_labels, 0) };
 }
 
 

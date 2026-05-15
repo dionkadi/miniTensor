@@ -49,7 +49,7 @@ public:
     Tensor<T> slice(size_t dim, size_t start, size_t end) const {
         if (dim >= shape().size())
             throw std::out_of_range("slice: dimension out of range");
-        if (start > end || end > shape()[dim])
+        if (start >= end || end > shape()[dim])
             throw std::out_of_range("slice: invalid range");
         if (start == 0 && end == shape()[dim])
             return *this;   // no-op

@@ -85,28 +85,35 @@ public:
         NoGradGuard guard;
         t_++;
 
+        T bias_correction1 = (T)1.0 - std::pow(beta1_, (T)t_);
+        T bias_correction2 = (T)1.0 - std::pow(beta2_, (T)t_);
+
         for (size_t i = 0; i < this->parameters_.size(); ++i) {
             auto& p = this->parameters_[i];
             if (p.grad().empty()) continue;
 
-            auto grad = p.grad();
+            auto& g = p.grad();
 
+            if (p.device().type == DeviceType::CUDA) {
+#if defined(USE_CUDA) || defined(USE_ROCM)
+                adam_step_gpu(p, g, m_[i], v_[i],
+                              lr_, beta1_, beta2_, eps_,
+                              bias_correction1, bias_correction2, weight_decay_);
+                continue;
+#endif
+            }
+
+            // CPU fallback: decomposed operations
+            auto grad = g;
             if (weight_decay_ > (T)0.0) {
                 grad = grad + (p * weight_decay_);
             }
-
             m_[i] = (m_[i] * beta1_) + (grad * ((T)1.0 - beta1_));
             v_[i] = (v_[i] * beta2_) + (pow2(grad) * ((T)1.0 - beta2_));
-
-            T bias_correction1 = (T)1.0 - std::pow(beta1_, (T)t_);
             Tensor<T> m_hat = m_[i] * ((T)1.0 / bias_correction1);
-
-            T bias_correction2 = (T)1.0 - std::pow(beta2_, (T)t_);
             Tensor<T> v_hat = v_[i] * ((T)1.0 / bias_correction2);
-
             Tensor<T> denom = sqrt(v_hat) + eps_;
             Tensor<T> step_size = (m_hat / denom) * lr_;
-
             sub_(p, step_size);
         }
     }
