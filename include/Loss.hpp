@@ -1,6 +1,7 @@
 #pragma once
 
 #include "Tensor.hpp"
+#include "TensorOps.hpp"
 
 // ---------------------------------------------------------
 // Mean Squared Error Loss
@@ -32,25 +33,30 @@ Tensor<T> mse_loss(const Tensor<T>& preds, const Tensor<T>& targets) {
 // ---------------------------------------------------------
 template<typename T>
 Tensor<T> cross_entropy(const Tensor<T>& logits, const Tensor<T>& targets) {
-    // Softmax: \exp(x_i) / \sum \exp(x_j)
+    if (logits.shape() != targets.shape()) {
+        throw std::invalid_argument("Cross-entropy requires logits and targets to have the same shape.");
+    }
+
+    if (logits.device().type != DeviceType::CPU) {
+        // GPU: fused forward + backward via CrossEntropyBackward node
+        Tensor<T> loss = cross_entropy_fwd_gpu(logits, targets);
+        if (GradMode::is_enabled() && logits.requires_grad()) {
+            loss.set_requires_grad(true);
+            loss.set_grad_fn(std::make_shared<CrossEntropyBackward<T>>(logits, targets));
+        }
+        return loss;
+    }
+
     Tensor<T> exp_l = exp(logits);
-    // Keepdims=true ensures broadcasting works division
-    Tensor<T> sum_exp = sum(exp_l, 1, true); 
+    Tensor<T> sum_exp = sum(exp_l, 1, true);
     Tensor<T> probs = exp_l / sum_exp;
-    
-    // Cross Entropy: targets * \ln(probs)
     Tensor<T> log_probs = log(probs);
     Tensor<T> ce_terms = targets * log_probs;
-    
     ce_terms = ce_terms * (T)-1.0;
-    
-    // Reduce sum over all elements
     Tensor<T> reduced = ce_terms;
     for (int i = reduced.shape().size() - 1; i >= 0; --i) {
         reduced = sum(reduced, i, false);
     }
-    
-    // Average over the batch size
-    T batch_size = (T)logits.shape()[0]; 
+    T batch_size = (T)logits.shape()[0];
     return reduced * ((T)1.0 / batch_size);
 }

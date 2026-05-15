@@ -37,7 +37,7 @@ public:
     Self reshape(const std::vector<size_t>& new_shape) const { return impl_->reshape(new_shape); }
     Self to(Device target_device) const { return impl_->to(target_device); }
     Self contiguous() const {
-        if (is_contiguous()) {
+        if (is_contiguous() && offset() == 0) {
             return *this;
         }
 

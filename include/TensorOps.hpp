@@ -668,6 +668,9 @@ template<typename T> std::pair<Tensor<T>, std::vector<size_t>> max_pool2d_gpu_st
 template<typename T> void max_pool2d_backward_gpu(const Tensor<T>& grad_output, Tensor<T>& grad_input, const std::vector<size_t>& h_indices);
 template<typename T> void max_pool2d_backward_gpu_strided(const Tensor<T>& grad_output, Tensor<T>& grad_input, const std::vector<size_t>& h_indices);
 template<typename T> void copy_gpu_strided(const Tensor<T> src, T* dst);
+template<typename T> Tensor<T> cross_entropy_fwd_gpu(const Tensor<T>&, const Tensor<T>&);
+template<typename T> void cross_entropy_bwd_gpu(const Tensor<T>&, const Tensor<T>&, const Tensor<T>&, Tensor<T>&);
+template<typename T> void adam_step_gpu(Tensor<T>& param, const Tensor<T>& grad, Tensor<T>& m, Tensor<T>& v, T lr, T beta1, T beta2, T eps, T bias_correction1, T bias_correction2, T weight_decay);
 #endif
 
 // #############################

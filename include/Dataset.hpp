@@ -7,6 +7,8 @@
 #include <random>
 #include <algorithm>
 
+#include "TensorOps.hpp"
+
 template<typename T> class Tensor;
 
 template<typename T>
@@ -39,8 +41,6 @@ public:
     }
 
     std::pair<Tensor<T>, Tensor<T>> get(size_t index) const override {
-        // Note: Your tensor library needs a way to slice a tensor at dimension 0!
-        // E.g., features_[index] or features.slice(0, index, index+1)
         return { features_.slice(0, index, index + 1), labels_.slice(0, index, index + 1) };
     }
 };
@@ -55,8 +55,8 @@ std::pair<Tensor<T>, Tensor<T>> default_collate(const std::vector<std::pair<Tens
         batch_labels.push_back(item.second);
     }
     
-    // Stack along dimension 0
-    return { concat(batch_features, 0), concat(batch_labels, 0) };
+    // Concat along dimension 0
+    return { stack(batch_features, 0), stack(batch_labels, 0) };
 }
 
 

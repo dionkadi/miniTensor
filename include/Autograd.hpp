@@ -265,13 +265,7 @@ struct SumBackward : public AutogradNode<T> {
         // or set to 1 (if keepdims).
         std::vector<size_t> target_shape = input.shape();
         
-        Tensor<T> grad_expanded = grad_output;
-
-        // Materialize non-contiguous expanded tensors before reshaping
-        // By multiplying by 1.0, dispatch_unary allocates a fresh, contiguous tensor.
-        if (!grad_expanded.is_contiguous()) {
-            grad_expanded = grad_expanded * (T)1.0; 
-        }
+        Tensor<T> grad_expanded = grad_output.contiguous();
         
         if (!keepdims) {
             // Insert a dimension of size 1 at the reduction axis to match target_shape
@@ -505,5 +499,30 @@ struct Conv2DBackward : public AutogradNode<T> {
 
     std::vector<Tensor<T>> get_inputs() const override { 
         return {saved_input.unpack(), saved_weight.unpack(), saved_bias.unpack()}; 
+    }
+};
+
+template<typename T>
+struct CrossEntropyBackward : public AutogradNode<T> {
+    SavedTensor<T> saved_logits;
+    SavedTensor<T> saved_targets;
+
+    CrossEntropyBackward(Tensor<T> logits, Tensor<T> targets)
+        : saved_logits(logits), saved_targets(targets) {}
+
+    void apply(const Tensor<T>& grad_output) override {
+        NoGradGuard guard;
+        Tensor<T> logits = saved_logits.unpack();
+        Tensor<T> targets = saved_targets.unpack();
+
+        if (logits.requires_grad()) {
+            Tensor<T> grad_logits(logits.shape(), logits.device());
+            cross_entropy_bwd_gpu(grad_output, logits, targets, grad_logits);
+            logits.accumulate_grad(grad_logits);
+        }
+    }
+
+    std::vector<Tensor<T>> get_inputs() const override {
+        return {saved_logits.unpack()};
     }
 };

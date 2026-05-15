@@ -2,6 +2,7 @@
 
 #include "Tensor.hpp"
 #include "Autograd.hpp"
+#include "TensorOps.hpp"
 
 template<typename T>
 class Optimizer {
@@ -86,33 +87,26 @@ public:
 
         for (size_t i = 0; i < this->parameters_.size(); ++i) {
             auto& p = this->parameters_[i];
-            
             if (p.grad().empty()) continue;
 
             auto grad = p.grad();
-            
+
             if (weight_decay_ > (T)0.0) {
                 grad = grad + (p * weight_decay_);
             }
 
-            // Update biased first moment estimate: m_t = beta1 * m_{t-1} + (1 - beta1) * g_t
             m_[i] = (m_[i] * beta1_) + (grad * ((T)1.0 - beta1_));
-
-            // Update biased second raw moment estimate: v_t = beta2 * v_{t-1} + (1 - beta2) * g_t^2
             v_[i] = (v_[i] * beta2_) + (pow2(grad) * ((T)1.0 - beta2_));
 
-            // Compute bias-corrected first moment estimate
             T bias_correction1 = (T)1.0 - std::pow(beta1_, (T)t_);
             Tensor<T> m_hat = m_[i] * ((T)1.0 / bias_correction1);
 
-            // Compute bias-corrected second raw moment estimate
             T bias_correction2 = (T)1.0 - std::pow(beta2_, (T)t_);
             Tensor<T> v_hat = v_[i] * ((T)1.0 / bias_correction2);
 
-            // Update parameters: p = p - lr * m_hat / (sqrt(v_hat) + eps)
             Tensor<T> denom = sqrt(v_hat) + eps_;
             Tensor<T> step_size = (m_hat / denom) * lr_;
-            
+
             sub_(p, step_size);
         }
     }

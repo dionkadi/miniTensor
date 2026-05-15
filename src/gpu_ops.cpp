@@ -3,14 +3,117 @@
 #include "TensorImpl.hpp"
 #include <cstddef>
 
+constexpr int WARP_SIZE = 32;
+constexpr int PAD = 1;
+
+// #######################################################
+// #   Helper Functions
+// #######################################################
+template<typename T, typename V>
+__device__ constexpr T& cast(const V* val) {
+    return reinterpret_cast<T*>(const_cast<V*>(val))[0];
+}
+
+template<size_t kWarpSize = WARP_SIZE>
+__device__ __forceinline__ float warp_reduce_sum(float val) {
+#pragma unroll
+    for (size_t mask = kWarpSize >> 1; mask >= 1; mask >>= 1) {
+        val += __shfl_xor_sync(~0ULL, val, mask);
+    }
+    return val;
+}
+
+template<size_t kWarpSize = WARP_SIZE>
+__device__ __forceinline__ float warp_reduce_max(float val) {
+#pragma unroll
+    for (size_t mask = kWarpSize >> 1; mask >= 1; mask >>= 1) {
+        val = fmaxf(val, __shfl_xor_sync(~0ULL, val, mask));
+    }
+    return val;
+}
+
+template<size_t BLOCK_SIZE>
+__device__ __forceinline__ float block_reduce_sum(float val) {
+    static __shared__ float shared[BLOCK_SIZE / 32];
+    int lane = threadIdx.x % 32;
+    int wid = threadIdx.x / 32;
+
+    val = warp_reduce_sum<32>(val);
+
+    // Write warp results to shared memory
+    if (lane == 0) shared[wid] = val;
+
+    __syncthreads();
+
+    // Read from shared memory and do final warp reduction
+    // Assuming BLOCK_SIZE <= 1024, so we have at most 32 warps
+    val = (threadIdx.x < (BLOCK_SIZE / 32)) ? shared[lane] : 0.0f;
+    if (wid == 0) {
+        val = warp_reduce_sum<32>(val);
+    }
+    return val;
+}
 // #######################################################
 // #   Generic GPU Kernels
 // #######################################################
 template<typename T, typename Op>
-__global__ void binary_kernel(const T* a, const T* b, T* c, size_t size, Op op) {
+__global__ void elementwise_unary_kernel(
+    const T *a, T *c, size_t N, Op op
+) {
+    size_t idx = blockDim.x * blockIdx.x + threadIdx.x;
+    if (idx < N) {
+        c[idx] = op(a[idx]);
+    }
+}
+
+template<typename Op>
+__global__ void elementwise_unary_vec_kernel(
+    const float *a, float *c, size_t N, Op op
+) {
+    size_t idx = 4 * (blockDim.x * blockIdx.x + threadIdx.x);
+    if ((idx + 3) < N) {
+        float4 reg_a = cast<float4>(&a[idx]);
+        float4 reg_c;
+        reg_c.x = op(reg_a.x);
+        reg_c.y = op(reg_a.y);
+        reg_c.z = op(reg_a.z);
+        reg_c.w = op(reg_a.w);
+        cast<float4>(&c[idx]) = reg_c;
+    } else if (idx < N) {
+        for (size_t i = 0; (idx + i) < N; ++i) {
+            c[idx + i] = op(a[idx + i]);
+        }
+    }
+}
+
+template<typename T, typename Op>
+__global__ void elementwise_binary_kernel(
+    const T *a, const T *b, T *c, size_t N, Op op
+) {
     size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < size) {
+    if (idx < N) {
         c[idx] = op(a[idx], b[idx]);
+    }
+}
+
+template<typename Op>
+__global__ void elementwise_binary_vec_kernel(
+    const float *a, const float *b, float *c, size_t N, Op op
+) {
+    size_t idx = 4 * (blockDim.x * blockIdx.x + threadIdx.x);
+    if ((idx + 3) < N) {
+        float4 reg_a = cast<float4>(&a[idx]);
+        float4 reg_b = cast<float4>(&b[idx]);
+        float4 reg_c;
+        reg_c.x = op(reg_a.x, reg_b.x);
+        reg_c.y = op(reg_a.y, reg_b.y);
+        reg_c.z = op(reg_a.z, reg_b.z);
+        reg_c.w = op(reg_a.w, reg_b.w);
+        cast<float4>(&c[idx]) = reg_c;
+    } else if (idx < N) {
+        for (size_t i = 0; (idx + i) < N; ++i) {
+            c[idx + i] = op(a[idx + i], b[idx + i]);
+        }
     }
 }
 
@@ -35,14 +138,6 @@ __global__ void binary_kernel_strided(
             phys_c += coord * info_C.strides[d];
         }
         c[offset_c + phys_c] = op(a[offset_a + phys_a], b[offset_b + phys_b]);
-    }
-}
-
-template<typename T, typename Op>
-__global__ void unary_kernel(const T* a, T* c, size_t size, Op op) {
-    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < size) {
-        c[idx] = op(a[idx]);
     }
 }
 
@@ -73,10 +168,19 @@ __global__ void unary_kernel_strided(
 // #######################################################
 template<typename T, typename Op>
 void binary_gpu(const Tensor<T>& A, const Tensor<T>& B, Tensor<T>& C, Op op) {
-    size_t total_elements = A.total_elements();
     int threads = 256;
-    int blocks = (total_elements + threads - 1) / threads;
-    binary_kernel<<<blocks, threads>>>(A.data(), B.data(), C.data(), total_elements, op);
+    size_t total_elements = A.total_elements();
+    
+    if constexpr (std::is_same_v<T, float>) {
+        int blocks = (total_elements + threads * 4 - 1) / (threads * 4);
+        elementwise_binary_vec_kernel<<<blocks, threads>>>(
+            A.data(), B.data(), C.data(), total_elements, op
+        );
+    } else {
+        int threads = 256;
+        int blocks = (total_elements + threads - 1) / threads;
+        elementwise_binary_kernel<<<blocks, threads>>>(A.data(), B.data(), C.data(), total_elements, op);
+    }
     
 #if defined(USE_CUDA)
     GPU_CHECK(cudaGetLastError()); GPU_CHECK(cudaDeviceSynchronize());
@@ -112,8 +216,14 @@ template<typename T, typename Op>
 void unary_gpu(const Tensor<T>& A, Tensor<T>& C, Op op) {
     size_t total_elements = A.total_elements();
     int threads = 256;
-    int blocks = (total_elements + threads - 1) / threads;
-    unary_kernel<<<blocks, threads>>>(A.data(), C.data(), total_elements, op);
+    
+    if constexpr (std::is_same_v<T, float>) {
+        int blocks = (total_elements + threads * 4 - 1) / (threads * 4);
+        elementwise_unary_vec_kernel<<<blocks, threads>>>(A.data(), C.data(), total_elements, op);
+    } else {
+        int blocks = (total_elements + threads - 1) / threads;
+        elementwise_unary_kernel<<<blocks, threads>>>(A.data(), C.data(), total_elements, op);
+    }
     
 #if defined(USE_CUDA)
     GPU_CHECK(cudaGetLastError()); GPU_CHECK(cudaDeviceSynchronize());
@@ -146,21 +256,186 @@ void unary_gpu_strided(const Tensor<T>& A, Tensor<T>& C, Op op) {
 // #######################################################
 // #   Non-Generic Ops
 // #######################################################
-template<typename T>
-__global__ void matmul_kernel(
-    const T *a, const T *b, T *c,
-    size_t M, size_t K, size_t N,
-    size_t offset_a, size_t offset_b, size_t offset_c
+template <const int BM = 128, const int BN = 128, const int BK = 8,
+          const int TM = 8, const int TN = 8, const int OFFSET = 0>
+__global__ void sgemm_kernel(
+    const float *a, const float *b, float *c, const int M, const int N, const int K
 ) {
-    size_t row = blockIdx.y * blockDim.y + threadIdx.y;
-    size_t col = blockIdx.x * blockDim.x + threadIdx.x;
+    int bx = blockIdx.x, by = blockIdx.y;
+    int tx = threadIdx.x, ty = threadIdx.y;
+    int tid = ty * blockDim.x + tx;
 
-    if (row < M && col < N) {
-        T sum = 0;
-        for (size_t k = 0; k < K; ++k) {
-            sum += a[offset_a + row * K + k] * b[offset_b + k * N + col];
+    __shared__ float s_a[2][BK][BM + OFFSET];
+    __shared__ float s_b[2][BK][BN + OFFSET];
+
+    float r_load_a[TM / 2];
+    float r_load_b[TN / 2];
+    float r_comp_a[TM];
+    float r_comp_b[TN];
+    float r_c[TM][TN] = {0.0f};
+
+    int load_a_smem_m = tid / 2;
+    int load_a_smem_k = (tid & 1) << 2;
+    int load_b_smem_k = tid / 32;
+    int load_b_smem_n = (tid & 31) << 2;
+
+    int load_a_gmem_m = by * BM + load_a_smem_m;
+    int load_b_gmem_n = bx * BN + load_b_smem_n;
+
+    {
+        int load_a_gmem_k = load_a_smem_k;
+        int load_a_gmem_addr = load_a_gmem_m * K + load_a_gmem_k;
+        int load_b_gmem_k = load_b_smem_k;
+        int load_b_gmem_addr = load_b_gmem_k * N + load_b_gmem_n;
+        if (load_a_gmem_m < M && load_a_gmem_k + 3 < K) {
+            cast<float4>(&r_load_a[0]) = cast<float4>(&a[load_a_gmem_addr]);
+        } else if (load_a_gmem_m < M && load_a_gmem_k < K) {
+            for (int j = 0; j < 4 && load_a_gmem_k + j < K; ++j)
+                r_load_a[j] = a[load_a_gmem_addr + j];
+            for (int j = K - load_a_gmem_k; j < 4; ++j)
+                r_load_a[j] = 0.0f;
+        } else {
+            r_load_a[0] = 0.0f; r_load_a[1] = 0.0f; r_load_a[2] = 0.0f; r_load_a[3] = 0.0f;
         }
-        c[offset_c + row * N + col] = sum;
+        if (load_b_gmem_k < K && load_b_gmem_n + 3 < N) {
+            cast<float4>(&r_load_b[0]) = cast<float4>(&b[load_b_gmem_addr]);
+        } else if (load_b_gmem_k < K && load_b_gmem_n < N) {
+            for (int j = 0; j < 4 && load_b_gmem_n + j < N; ++j)
+                r_load_b[j] = b[load_b_gmem_addr + j];
+            for (int j = N - load_b_gmem_n; j < 4; ++j)
+                r_load_b[j] = 0.0f;
+        } else {
+            r_load_b[0] = 0.0f; r_load_b[1] = 0.0f; r_load_b[2] = 0.0f; r_load_b[3] = 0.0f;
+        }
+
+        s_a[0][load_a_smem_k + 0][load_a_smem_m] = r_load_a[0];
+        s_a[0][load_a_smem_k + 1][load_a_smem_m] = r_load_a[1];
+        s_a[0][load_a_smem_k + 2][load_a_smem_m] = r_load_a[2];
+        s_a[0][load_a_smem_k + 3][load_a_smem_m] = r_load_a[3];
+        cast<float4>(&s_b[0][load_b_smem_k][load_b_smem_n]) = cast<float4>(&r_load_b[0]);
+    }
+
+    __syncthreads();
+
+    for (int bk = 1; bk < (K + BK - 1) / BK; ++bk) {
+        int smem_sel = (bk - 1) & 1;
+        int smem_sel_next = bk & 1;
+
+        int load_a_gmem_k = bk * BK + load_a_smem_k;
+        int load_a_gmem_addr = load_a_gmem_m * K + load_a_gmem_k;
+        int load_b_gmem_k = bk * BK + load_b_smem_k;
+        int load_b_gmem_addr = load_b_gmem_k * N + load_b_gmem_n;
+        if (load_a_gmem_m < M && load_a_gmem_k + 3 < K) {
+            cast<float4>(&r_load_a[0]) = cast<float4>(&a[load_a_gmem_addr]);
+        } else if (load_a_gmem_m < M && load_a_gmem_k < K) {
+            for (int j = 0; j < 4 && load_a_gmem_k + j < K; ++j)
+                r_load_a[j] = a[load_a_gmem_addr + j];
+            for (int j = K - load_a_gmem_k; j < 4; ++j)
+                r_load_a[j] = 0.0f;
+        } else {
+            r_load_a[0] = 0.0f; r_load_a[1] = 0.0f; r_load_a[2] = 0.0f; r_load_a[3] = 0.0f;
+        }
+        if (load_b_gmem_k < K && load_b_gmem_n + 3 < N) {
+            cast<float4>(&r_load_b[0]) = cast<float4>(&b[load_b_gmem_addr]);
+        } else if (load_b_gmem_k < K && load_b_gmem_n < N) {
+            for (int j = 0; j < 4 && load_b_gmem_n + j < N; ++j)
+                r_load_b[j] = b[load_b_gmem_addr + j];
+            for (int j = N - load_b_gmem_n; j < 4; ++j)
+                r_load_b[j] = 0.0f;
+        } else {
+            r_load_b[0] = 0.0f; r_load_b[1] = 0.0f; r_load_b[2] = 0.0f; r_load_b[3] = 0.0f;
+        }
+
+        #pragma unroll
+        for (int tk = 0; tk < BK; ++tk) {
+            cast<float4>(&r_comp_a[0]) = cast<float4>(&s_a[smem_sel][tk][ty * TM / 2]);
+            cast<float4>(&r_comp_a[4]) = cast<float4>(&s_a[smem_sel][tk][ty * TM / 2 + BM / 2]);
+            cast<float4>(&r_comp_b[0]) = cast<float4>(&s_b[smem_sel][tk][tx * TN / 2]);
+            cast<float4>(&r_comp_b[4]) = cast<float4>(&s_b[smem_sel][tk][tx * TN / 2 + BN / 2]);
+
+            #pragma unroll
+            for (int tm = 0; tm < TM; ++tm) {
+                #pragma unroll
+                for (int tn = 0; tn < TN; ++tn) {
+                    r_c[tm][tn] = __fmaf_rn(r_comp_a[tm], r_comp_b[tn], r_c[tm][tn]);
+                }
+            }
+        }
+
+        s_a[smem_sel_next][load_a_smem_k + 0][load_a_smem_m] = r_load_a[0];
+        s_a[smem_sel_next][load_a_smem_k + 1][load_a_smem_m] = r_load_a[1];
+        s_a[smem_sel_next][load_a_smem_k + 2][load_a_smem_m] = r_load_a[2];
+        s_a[smem_sel_next][load_a_smem_k + 3][load_a_smem_m] = r_load_a[3];
+        cast<float4>(&s_b[smem_sel_next][load_b_smem_k][load_b_smem_n]) = cast<float4>(&r_load_b[0]);
+
+        __syncthreads();
+    }
+
+    int smem_sel_last = ((K + BK - 1) / BK - 1) & 1;
+
+    #pragma unroll
+    for (int tk = 0; tk < BK; tk++) {
+        cast<float4>(&r_comp_a[0]) = cast<float4>(&s_a[smem_sel_last][tk][ty * TM / 2]);
+        cast<float4>(&r_comp_a[4]) = cast<float4>(&s_a[smem_sel_last][tk][ty * TM / 2 + BM / 2]);
+        cast<float4>(&r_comp_b[0]) = cast<float4>(&s_b[smem_sel_last][tk][tx * TN / 2]);
+        cast<float4>(&r_comp_b[4]) = cast<float4>(&s_b[smem_sel_last][tk][tx * TN / 2 + BN / 2]);
+
+        #pragma unroll
+        for (int tm = 0; tm < TM; tm++) {
+            #pragma unroll
+            for (int tn = 0; tn < TN; tn++) {
+                // r_c[tm][tn] += r_comp_a[tm] * r_comp_b[tn];
+                r_c[tm][tn] = __fmaf_rn(r_comp_a[tm], r_comp_b[tn], r_c[tm][tn]);
+            }
+        }
+    }
+
+    #pragma unroll
+    for (int i = 0; i < TM / 2; i++) {
+        int store_c_gmem_m = by * BM + ty * TM / 2 + i;
+        int store_c_gmem_n = bx * BN + tx * TN / 2;
+        if (store_c_gmem_m < M && store_c_gmem_n < N) {
+            int store_c_gmem_addr = store_c_gmem_m * N + store_c_gmem_n;
+            if (store_c_gmem_n + 3 < N) {
+                cast<float4>(&c[store_c_gmem_addr]) = cast<float4>(&r_c[i][0]);
+            } else {
+                for (int j = 0; j < 4 && store_c_gmem_n + j < N; ++j)
+                    c[store_c_gmem_addr + j] = r_c[i][j];
+            }
+        }
+        if (store_c_gmem_m < M && store_c_gmem_n + BN / 2 < N) {
+            int store_c_gmem_addr = store_c_gmem_m * N + store_c_gmem_n;
+            if (store_c_gmem_n + BN / 2 + 3 < N) {
+                cast<float4>(&c[store_c_gmem_addr + BN / 2]) = cast<float4>(&r_c[i][4]);
+            } else {
+                for (int j = 0; j < 4 && store_c_gmem_n + BN / 2 + j < N; ++j)
+                    c[store_c_gmem_addr + BN / 2 + j] = r_c[i][4 + j];
+            }
+        }
+    }
+
+    #pragma unroll
+    for (int i = 0; i < TM / 2; i++) {
+        int store_c_gmem_m = by * BM + BM / 2 + ty * TM / 2 + i;
+        int store_c_gmem_n = bx * BN + tx * TN / 2;
+        if (store_c_gmem_m < M && store_c_gmem_n < N) {
+            int store_c_gmem_addr = store_c_gmem_m * N + store_c_gmem_n;
+            if (store_c_gmem_n + 3 < N) {
+                cast<float4>(&c[store_c_gmem_addr]) = cast<float4>(&r_c[i + TM / 2][0]);
+            } else {
+                for (int j = 0; j < 4 && store_c_gmem_n + j < N; ++j)
+                    c[store_c_gmem_addr + j] = r_c[i + TM / 2][j];
+            }
+        }
+        if (store_c_gmem_m < M && store_c_gmem_n + BN / 2 < N) {
+            int store_c_gmem_addr = store_c_gmem_m * N + store_c_gmem_n;
+            if (store_c_gmem_n + BN / 2 + 3 < N) {
+                cast<float4>(&c[store_c_gmem_addr + BN / 2]) = cast<float4>(&r_c[i + TM / 2][4]);
+            } else {
+                for (int j = 0; j < 4 && store_c_gmem_n + BN / 2 + j < N; ++j)
+                    c[store_c_gmem_addr + BN / 2 + j] = r_c[i + TM / 2][4 + j];
+            }
+        }
     }
 }
 
@@ -193,15 +468,12 @@ void matmul_gpu(const Tensor<T>& A, const Tensor<T>& B, Tensor<T>& C) {
     size_t K = A.shape()[1];
     size_t N = B.shape()[1];
 
-    // Standard 16x16 thread block for 2D grid
+    constexpr int BM = 128, BN = 128, BK = 8;
+    constexpr int TM = 8, TN = 8;
     dim3 threads(16, 16);
-    dim3 blocks((N + threads.x - 1) / threads.x, 
-                (M + threads.y - 1) / threads.y);
-
-    matmul_kernel<<<blocks, threads>>>(
-        A.data(), B.data(), C.data(),
-        M, K, N,
-        A.offset(), B.offset(), C.offset()
+    dim3 blocks((N + BN - 1) / BN, (M + BM - 1) / BM);
+    sgemm_kernel<BM, BN, BK, TM, TN, 1><<<blocks, threads>>>(
+        A.data(), B.data(), C.data(), M, N, K
     );
 
 #if defined(USE_CUDA)
@@ -241,57 +513,94 @@ void matmul_gpu_strided(const Tensor<T>& A, const Tensor<T>& B, Tensor<T>& C) {
 #endif
 }
 
+// #######################################################
+// #   Batched GEMM for Conv
+// #######################################################
+// Computes: out[b, m, s] = sum_k a[m, k] * b[b, k, s] for all batch items.
+// a = [M, K] (shared across batch), b = [B, K, N_mat], c = [B, M, N_mat].
+// The output layout [B, M, N_mat] is compatible with conv output tensors.
 template<typename T>
-__global__ void sum_kernel(
-    const T *in, T *out,
-    size_t total_elements,
-    TensorInfo in_info,
-    TensorInfo out_info,
-    size_t reduce_axis,
-    bool keepdims,
-    size_t offset_in, 
-    size_t offset_out
+__global__ void batched_gemm_kernel(
+    const T* __restrict__ a, const T* __restrict__ b, T* __restrict__ c,
+    int B, int M, int K, int N_mat
 ) {
-    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = B * M * N_mat;
+    if (idx >= total) return;
 
-    if (idx < total_elements) {
-        size_t temp_idx = idx;
-        size_t in_phys_offset = 0;
-        size_t out_phys_offset = 0;
+    int n = idx / (M * N_mat);
+    int r = (idx % (M * N_mat)) / N_mat;
+    int s = idx % N_mat;
 
-        // Map linear index back to N-dimensional coordinates
-        for (int d = in_info.ndims - 1; d >= 0; --d) {
-            size_t coord = temp_idx % in_info.shape[d];
-            temp_idx /= in_info.shape[d];
+    T sum = 0;
+    const T* b_row = b + n * K * N_mat + s;
+    for (int k = 0; k < K; ++k) {
+        sum += a[r * K + k] * b_row[k * N_mat];
+    }
+    c[idx] = sum;
+}
 
-            in_phys_offset += coord * in_info.strides[d];
+// #######################################################
+// #   Non-Generic Ops
+// #######################################################
+__global__ void reduce_axis_kernel(
+    const float* __restrict__ a, 
+    float* __restrict__ y,
+    const int outer_size, 
+    const int reduce_size, 
+    const int inner_size  // > 1
+) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int N = outer_size * inner_size;
 
-            // Determine where this coordinate falls in the output tensor
-            if (d == reduce_axis) {
-                // We are reducing along this axis, so it maps to index 0 in the output
-                if (keepdims) {
-                    // The dimension still exists (size 1), so its stride is used but coord is 0
-                    out_phys_offset += 0 * out_info.strides[d];
-                }
-                // If not keepdims, this dimension doesn't exist in the output, so we add nothing.
-            } else {
-                // Find the corresponding dimension in the output tensor
-                int out_d = keepdims ? d : (d > reduce_axis ? d - 1 : d);
-                out_phys_offset += coord * out_info.strides[out_d];
-            }
+    if (tid < N) {
+        int outer_idx = tid / inner_size;
+        int inner_idx = tid % inner_size;
+
+        float sum = 0.0f;
+
+        for (int i = 0; i < reduce_size; ++i) {
+            int input_dix = (outer_idx * reduce_size + i) * inner_size + inner_idx;
+            sum += a[input_dix];
         }
 
-        atomicAdd(&out[offset_out + out_phys_offset], in[offset_in + in_phys_offset]);
+        y[tid] = sum;
+    }
+}
+
+template<size_t BLOCK_SIZE>
+__global__ void reduce_axis_inner_kernel(
+    const float* __restrict__ a, 
+    float* __restrict__ y,
+    const int outer_size, 
+    const int reduce_size
+    // const int inner_size == 1
+) {
+    int row = blockIdx.x;
+    if (row >= outer_size) return;
+
+    int tid = threadIdx.x;
+    float sum = 0.0f;
+
+    int row_offset = row * reduce_size;
+    for (int i = tid; i < reduce_size; i += BLOCK_SIZE) {
+        sum += a[row_offset + i];
+    }
+
+    sum = block_reduce_sum<BLOCK_SIZE>(sum);
+
+    if (tid == 0) {
+        y[row] = sum;
     }
 }
 
 template<typename T>
 Tensor<T> sum_gpu(const Tensor<T>& input, size_t axis, bool keepdims) {
-    const auto& in_shape = input.shape();
-    
-    if (axis >= in_shape.size()) {
-        throw std::invalid_argument("Reduction axis is out of bounds.");
-    }
+    Tensor<T> in = input.contiguous();
+    const auto& in_shape = in.shape();
+    size_t outer = 1, reduce = in_shape[axis], inner = 1;
+    for (size_t i = 0; i < axis; ++i) outer *= in_shape[i];
+    for (size_t i = axis+1; i < in_shape.size(); ++i) inner *= in_shape[i];
 
     std::vector<size_t> out_shape = in_shape;
     if (keepdims) {
@@ -299,7 +608,6 @@ Tensor<T> sum_gpu(const Tensor<T>& input, size_t axis, bool keepdims) {
     } else {
         out_shape.erase(out_shape.begin() + axis);
     }
-
     Tensor<T> output(out_shape, input.device());
 
     size_t bytes = output.total_elements() * sizeof(T);
@@ -309,20 +617,17 @@ Tensor<T> sum_gpu(const Tensor<T>& input, size_t axis, bool keepdims) {
     GPU_CHECK(hipMemset(output.data(), 0, bytes));
 #endif
 
-    size_t total_elements = input.total_elements();
-    size_t threads = 256;
-    size_t blocks = (total_elements + threads - 1) / threads;
-
-    TensorInfo in_info(input.shape(), input.strides());
-    TensorInfo out_info(output.shape(), output.strides());
-
-    sum_kernel<<<blocks, threads>>>(
-        input.data(), output.data(),
-        total_elements,
-        in_info, out_info,
-        axis, keepdims,
-        input.offset(), output.offset()
-    );
+    if (inner > 1) {
+        int threads = 256;
+        int blocks = (outer * inner + threads - 1) / threads;
+        reduce_axis_kernel<<<blocks, threads>>>(in.data(), output.data(),
+                                                outer, reduce, inner);
+    } else {
+        int threads = 256;
+        int blocks = outer;   // one block per row
+        reduce_axis_inner_kernel<256><<<blocks, threads>>>(in.data(), output.data(),
+                                                           outer, reduce);
+    }
 
 #if defined(USE_CUDA)
     GPU_CHECK(cudaGetLastError());
@@ -336,42 +641,205 @@ Tensor<T> sum_gpu(const Tensor<T>& input, size_t axis, bool keepdims) {
 }
 
 template<typename T>
-__global__ void conv2d_forward_kernel(
-    const T* __restrict__ in, const T* __restrict__ wt, const T* __restrict__ bs,
-    T* __restrict__ out,
-    size_t N, size_t C_in, size_t H, size_t W,
-    size_t C_out, size_t kH, size_t kW,
-    size_t H_out, size_t W_out,
-    size_t stride, size_t padding)
-{
+__global__ void mat_transpose_kernel(
+    const T *x, T *y, int row, int col
+) {
+    int global_x = blockIdx.x * blockDim.x + threadIdx.x;
+    int global_y = blockIdx.y * blockDim.y + threadIdx.y;
+    int local_x = threadIdx.x;
+    int local_y = threadIdx.y;
+
+    const int STRIDE = WARP_SIZE;
+
+    __shared__ T tile[WARP_SIZE][WARP_SIZE + PAD];
+
+    // All threads participate in loading — fixes __syncthreads divergence bug
+    if (global_y < row && global_x < col) {
+        tile[local_y][local_x] = x[global_y * col + global_x];
+    } else {
+        tile[local_y][local_x] = T(0);
+    }
+
+    __syncthreads();
+
+    // Diagonal-style coalesced write
+    if (global_y < row && global_x < col) {
+        float smem_val = tile[local_y % STRIDE][local_x + local_y / STRIDE];
+        int bid_y = blockIdx.y;
+        int out_y = global_x + local_y / STRIDE;
+        int out_x = (local_y % STRIDE) + bid_y * STRIDE;
+        y[out_y * row + out_x] = smem_val;
+    }
+}
+
+__global__ void mat_transpose_vec_kernel(
+    float *x, float *y, int row, int col
+) {
+    int global_x = blockIdx.x * blockDim.x + threadIdx.x;
+    int global_y = blockIdx.y * blockDim.y + threadIdx.y;
+    int local_x = threadIdx.x;
+    int local_y = threadIdx.y;
+    const int STRIDE = WARP_SIZE / 4;
+    __shared__ float tile[WARP_SIZE][WARP_SIZE * 4 + PAD];
+
+    // All threads participate in loading
+    if (global_y * 4 < row && global_x < col) {
+        float4 x_val = reinterpret_cast<float4 *>(x)[global_y * col / 4 + global_x];
+        tile[local_y][local_x * 4] = x_val.x;
+        tile[local_y][local_x * 4 + 1] = x_val.y;
+        tile[local_y][local_x * 4 + 2] = x_val.z;
+        tile[local_y][local_x * 4 + 3] = x_val.w;
+    } else {
+        tile[local_y][local_x * 4] = 0.0f;
+        tile[local_y][local_x * 4 + 1] = 0.0f;
+        tile[local_y][local_x * 4 + 2] = 0.0f;
+        tile[local_y][local_x * 4 + 3] = 0.0f;
+    }
+
+    __syncthreads();
+
+    // Diagonal-style coalesced write
+    if (global_y * 4 < row && global_x < col) {
+        float4 smem_val;
+        smem_val.x = tile[(local_y % STRIDE) * 4][local_x * 4 + local_y / STRIDE];
+        smem_val.y = tile[(local_y % STRIDE) * 4 + 1][local_x * 4 + local_y / STRIDE];
+        smem_val.z = tile[(local_y % STRIDE) * 4 + 2][local_x * 4 + local_y / STRIDE];
+        smem_val.w = tile[(local_y % STRIDE) * 4 + 3][local_x * 4 + local_y / STRIDE];
+
+        int bid_y = blockIdx.y;
+        int out_y = global_x * 4 + local_y / STRIDE;
+        int out_x = (local_y % STRIDE) * 4 + bid_y * WARP_SIZE;
+        reinterpret_cast<float4 *>(y)[out_y * row + out_x] = cast<float4>(&smem_val);
+    }
+}
+
+template<typename T>
+__global__ void add_bias_kernel(T* out, const T* bias, int N, int C_out, int H_out, int W_out) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total_out = N * C_out * H_out * W_out;
-    if (idx >= total_out) return;
+    if (idx < N * C_out * H_out * W_out) {
+        int c = (idx / (H_out * W_out)) % C_out;
+        out[idx] += bias[c];
+    }
+}
 
-    // Decompose linear index
-    int n = idx / (C_out * H_out * W_out);
-    int rem = idx % (C_out * H_out * W_out);
-    int c_out = rem / (H_out * W_out);
-    rem %= (H_out * W_out);
-    int y = rem / W_out;
-    int x = rem % W_out;
+// Grid: dim3(ceil(W_out/TILE_W), ceil(H_out/TILE_H), N * C)
+// Block: dim3(TILE_W, TILE_H, 1)
+// flatten to [N, C * kH * kW, H_out * W_out]
+template<typename T>
+__global__ void im2col_kernel(
+    const T* __restrict__ data_im, 
+    T* __restrict__ data_col,
+    int N, int C, int H, int W,
+    int kH, int kW, int pad, int stride,
+    int H_out, int W_out
+) {
+    int w_out_base = (blockIdx.x * blockDim.x + threadIdx.x) * 4;
+    int h_out = blockIdx.y * blockDim.y + threadIdx.y;
 
-    T val = (bs != nullptr) ? bs[c_out] : (T)0.0;
+    int c_in = blockIdx.z % C;
+    int n    = blockIdx.z / C;
 
-    for (int c_in = 0; c_in < C_in; ++c_in) {
-        for (int r = 0; r < kH; ++r) {
-            for (int s_ = 0; s_ < kW; ++s_) {
-                int in_y = static_cast<int>(y * stride + r - padding);
-                int in_x = static_cast<int>(x * stride + s_ - padding);
-                if (in_y >= 0 && in_y < H && in_x >= 0 && in_x < W) {
-                    size_t in_idx = (n * C_in + c_in) * (H * W) + in_y * W + in_x;
-                    size_t w_idx = ((c_out * C_in + c_in) * kH + r) * kW + s_;
-                    val += in[in_idx] * wt[w_idx];
+    int in_tile_w = (blockDim.x * 4 - 1) * stride + kW;
+    int in_tile_h = (blockDim.y - 1) * stride + kH;
+
+    extern __shared__ __align__(sizeof(T)) unsigned char smem[];
+    T* img_smem = reinterpret_cast<T*>(smem);
+
+    // top-left
+    int block_start_w_in = blockIdx.x * (blockDim.x * 4) * stride - pad;
+    int block_start_h_in = blockIdx.y * blockDim.y * stride - pad;
+
+    int flat_dix = threadIdx.y * blockDim.x + threadIdx.x;
+    int num_threads = blockDim.x * blockDim.y;
+    int total_elements = in_tile_h * in_tile_w;
+    for (int i = flat_dix; i < total_elements; i += num_threads) {
+        int smem_w = i % in_tile_w;
+        int smem_h = i / in_tile_w;
+
+        int im_w = block_start_w_in + smem_w;
+        int im_h = block_start_h_in + smem_h;
+
+        if (im_h >= 0 && im_h < H && im_w >= 0 && im_w < W) {
+            img_smem[i] = data_im[((n * C + c_in) * H + im_h) * W + im_w];
+        } else {
+            img_smem[i] = 0.0f;
+        }
+    }
+
+    __syncthreads();
+
+    if (h_out < H_out) {
+        for (int h_k = 0; h_k < kH; ++h_k) {
+            for (int w_k = 0; w_k < kW; ++w_k) {
+                int smem_h = threadIdx.y * stride + h_k;
+
+                #pragma unroll
+                for (int v = 0; v < 4; ++v) {
+                    int w_out = w_out_base + v;
+                    
+                    if (w_out < W_out) {
+                        int smem_w = (threadIdx.x * 4 + v) * stride + w_k;
+                        float val = img_smem[smem_h * in_tile_w + smem_w];
+
+                        int channel_kernel_idx = c_in * (kH * kW) + h_k * kW + w_k;
+                        int spatial_out_idx = h_out * W_out + w_out;
+                        int spatial_out_area = H_out * W_out;
+
+                        int col_idx = n * (C * kH * kW * spatial_out_area) + 
+                                    channel_kernel_idx * spatial_out_area + 
+                                    spatial_out_idx;
+
+                        data_col[col_idx] = val;
+                    }
                 }
             }
         }
     }
-    out[idx] = val;
+}
+
+// Grid: dim3(ceil(W / TILE_W), ceil(H / TILE_H), N * C)
+// Block: dim3(TILE_W, TILE_H, 1)
+// Output: reconstructs data_im of shape [N, C, H, W]
+template<typename T>
+__global__ void col2im_kernel(
+    const T* __restrict__ data_col, 
+    T* __restrict__ data_im,
+    int N, int C, int H, int W,
+    int kH, int kW, int pad, int stride,
+    int H_out, int W_out
+) {
+    int w = blockIdx.x * blockDim.x + threadIdx.x;
+    int h = blockIdx.y * blockDim.y + threadIdx.y;
+    int c = blockIdx.z % C;
+    int n = blockIdx.z / C;
+
+    if (h >= H || w >= W) return;
+
+    T val = (T)0.0f;
+
+    int h_out_start = (h + pad < kH) ? 0 : (h + pad - kH) / stride + 1;
+    int h_out_end   = min((h + pad) / stride + 1, H_out);
+    int w_out_start = (w + pad < kW) ? 0 : (w + pad - kW) / stride + 1;
+    int w_out_end   = min((w + pad) / stride + 1, W_out);
+
+    int spatial_area = H_out * W_out;
+    int batch_channel_offset = n * (C * kH * kW * spatial_area);
+
+    for (int h_out = h_out_start; h_out < h_out_end; ++h_out) {
+        int h_k = (h + pad) - h_out * stride;
+        for (int w_out = w_out_start; w_out < w_out_end; ++w_out) {
+            int w_k = (w + pad) - w_out * stride;
+            
+            int channel_idx = c * (kW * kH) + h_k * kW + w_k;
+            int spatial_out_idx = h_out * H_out + w_out;
+
+            int col_idx = batch_channel_offset + channel_idx * spatial_area + spatial_out_idx;
+
+            val += data_col[col_idx];
+        }
+    }
+
+    data_im[((n * C + c) * H + h) * W + w] = val;
 }
 
 template<typename T>
@@ -383,15 +851,24 @@ void conv2d_gpu(
     size_t N = input.shape()[0], C_in = input.shape()[1], H = input.shape()[2], W = input.shape()[3];
     size_t C_out = weight.shape()[0], kH = weight.shape()[2], kW = weight.shape()[3];
     size_t H_out = output.shape()[2], W_out = output.shape()[3];
-    size_t total_out = N * C_out * H_out * W_out;
+    
+    size_t M = C_out;
+    size_t K = C_in * kH * kW;
+    size_t N_mat = H_out * W_out;
 
-    int threads = 256;
-    int blocks = (total_out + threads - 1) / threads;
+    T* d_data_col;
+    size_t col_size = N * K * N_mat * sizeof(T);
+    d_data_col = static_cast<T*>(MemoryPool::get().allocate(col_size, Device{DeviceType::CUDA}));
 
-    conv2d_forward_kernel<<<blocks, threads>>>(
-        input.data(), weight.data(), bias.empty() ? nullptr : bias.data(),
-        output.data(),
-        N, C_in, H, W, C_out, kH, kW, H_out, W_out, stride, padding);
+    dim3 threads(16, 16);
+    dim3 blocks((W_out + threads.x * 4 - 1) / (threads.x * 4), 
+                (H_out + threads.y - 1) / threads.y, 
+                N * C_in);
+    size_t smem_size = ((threads.y - 1) * stride + kH) * ((threads.x * 4 - 1) * stride + kW) * sizeof(T);
+    
+    im2col_kernel<T><<<blocks, threads, smem_size>>>(
+        input.data(), d_data_col, N, C_in, H, W, kH, kW, padding, stride, H_out, W_out
+    );
 
 #if defined(USE_CUDA)
     GPU_CHECK(cudaGetLastError());
@@ -400,7 +877,53 @@ void conv2d_gpu(
     GPU_CHECK(hipGetLastError());
     GPU_CHECK(hipDeviceSynchronize());
 #endif
+
+    for (size_t n = 0; n < N; ++n) {
+        T* col_ptr = d_data_col + n * (K * N_mat);
+        T* out_ptr = output.data() + n * (M * N_mat);
+        
+        dim3 mm_threads(16, 16);
+        if constexpr (std::is_same_v<T, float>) {
+            dim3 mm_blocks((N_mat + 127) / 128, (M + 127) / 128);
+            sgemm_kernel<128, 128, 8, 8, 8, 1><<<mm_blocks, mm_threads>>>(
+                reinterpret_cast<const float*>(weight.data()), 
+                reinterpret_cast<const float*>(col_ptr), 
+                reinterpret_cast<float*>(out_ptr), 
+                M, N_mat, K
+            );
+        } else {
+            dim3 strided_blocks((N_mat + 15) / 16, (M + 15) / 16);
+            matmul_kernel_strided<T><<<strided_blocks, mm_threads>>>(
+                weight.data(), col_ptr, out_ptr,
+                M, K, N_mat, K, 1, N_mat, 1, N_mat, 1, 0, 0, 0
+            );
+        }
+    }
+
+#if defined(USE_CUDA)
+    GPU_CHECK(cudaGetLastError());
+    GPU_CHECK(cudaDeviceSynchronize());
+#elif defined(USE_ROCM)
+    GPU_CHECK(hipGetLastError());
+    GPU_CHECK(hipDeviceSynchronize());
+#endif
+
+    if (!bias.empty()) {
+        size_t total_out = N * C_out * H_out * W_out;
+        int b_threads = 256;
+        int b_blocks = (total_out + b_threads - 1) / b_threads;
+        add_bias_kernel<T><<<b_blocks, b_threads>>>(output.data(), bias.data(), N, C_out, H_out, W_out);
+    }
+#if defined(USE_CUDA)
+    GPU_CHECK(cudaGetLastError());
+    GPU_CHECK(cudaDeviceSynchronize());
+#elif defined(USE_ROCM)
+    GPU_CHECK(hipGetLastError());
+    GPU_CHECK(hipDeviceSynchronize());
+#endif
+    MemoryPool::get().free(d_data_col, col_size, Device{DeviceType::CUDA});
 }
+
 
 template<typename T>
 __global__ void conv2d_forward_kernel_strided(
@@ -425,7 +948,7 @@ __global__ void conv2d_forward_kernel_strided(
     int y = rem / W_out;
     int x = rem % W_out;
 
-    T val = (bs != nullptr) ? bs[c_out * info_wt.strides[0]] : (T)0.0;
+    T val = (bs != nullptr) ? bs[c_out] : (T)0.0;
 
     for (int c_in = 0; c_in < C_in; ++c_in) {
         for (int r = 0; r < kH; ++r) {
@@ -579,21 +1102,27 @@ void conv2d_backward_input_gpu(const Tensor<T>& grad_output, const Tensor<T>& we
     size_t N = grad_input.shape()[0], C_in = grad_input.shape()[1], H = grad_input.shape()[2], W = grad_input.shape()[3];
     size_t C_out = weight.shape()[0], kH = weight.shape()[2], kW = weight.shape()[3];
     size_t H_out = grad_output.shape()[2], W_out = grad_output.shape()[3];
-    size_t total_out = N * C_out * H_out * W_out;
-    size_t total_in = grad_input.total_elements();
+    
+    size_t K = C_out;
+    size_t M = C_in * kH * kW;
+    size_t N_mat = H_out * W_out;
 
-    int threads = 256;
-    int blocks = (total_out + threads - 1) / threads;
-
+    T* d_grad_col;
+    T* d_weight_T;
+    size_t grad_col_size = N * M * N_mat * sizeof(T);
+    size_t weight_T_size = K * M * sizeof(T);
+    d_grad_col = static_cast<T*>(MemoryPool::get().allocate(grad_col_size, Device{DeviceType::CUDA}));
+    d_weight_T = static_cast<T*>(MemoryPool::get().allocate(weight_T_size, Device{DeviceType::CUDA}));
 #if defined(USE_CUDA)
-    GPU_CHECK(cudaMemset(grad_input.data(), 0, total_in * sizeof(T)));
+    GPU_CHECK(cudaMemset(grad_input.data(), 0, grad_input.total_elements() * sizeof(T)));
 #elif defined(USE_ROCM)
-    GPU_CHECK(hipMemset(grad_input.data(), 0, total_in * sizeof(T)));
+    GPU_CHECK(hipMemset(grad_input.data(), 0, grad_input.total_elements() * sizeof(T)));
 #endif
 
-    conv2d_backward_input_kernel<<<blocks, threads>>>(
-        grad_output.data(), weight.data(), grad_input.data(), 
-        N, C_in, H, W, C_out, kH, kW, H_out, W_out, stride, padding);
+    // Transpose the weights (W^T)
+    dim3 tp_threads(WARP_SIZE, WARP_SIZE);
+    dim3 tp_blocks((M + WARP_SIZE - 1) / WARP_SIZE, (K + WARP_SIZE - 1) / WARP_SIZE);
+    mat_transpose_kernel<T><<<tp_blocks, tp_threads>>>(weight.data(), d_weight_T, K, M);
 
 #if defined(USE_CUDA)
     GPU_CHECK(cudaGetLastError());
@@ -602,6 +1131,53 @@ void conv2d_backward_input_gpu(const Tensor<T>& grad_output, const Tensor<T>& we
     GPU_CHECK(hipGetLastError());
     GPU_CHECK(hipDeviceSynchronize());
 #endif
+
+    for (size_t n = 0; n < N; ++n) {
+        T* grad_out_ptr = const_cast<T*>(grad_output.data()) + n * (K * N_mat);
+        T* grad_col_ptr = d_grad_col + n * (M * N_mat);
+        
+        dim3 mm_threads(16, 16);
+        if constexpr (std::is_same_v<T, float>) {
+            dim3 mm_blocks((N_mat + 127) / 128, (M + 127) / 128);
+            sgemm_kernel<128, 128, 8, 8, 8, 1><<<mm_blocks, mm_threads>>>(
+                reinterpret_cast<const float*>(d_weight_T), 
+                reinterpret_cast<const float*>(grad_out_ptr), 
+                reinterpret_cast<float*>(grad_col_ptr), 
+                M, N_mat, K
+            );
+        } else {
+            dim3 strided_blocks((N_mat + 15) / 16, (M + 15) / 16);
+            matmul_kernel_strided<T><<<strided_blocks, mm_threads>>>(
+                d_weight_T, grad_out_ptr, grad_col_ptr,
+                M, K, N_mat, K, 1, N_mat, 1, N_mat, 1, 0, 0, 0
+            );
+        }
+    }
+
+#if defined(USE_CUDA)
+    GPU_CHECK(cudaGetLastError());
+    GPU_CHECK(cudaDeviceSynchronize());
+#elif defined(USE_ROCM)
+    GPU_CHECK(hipGetLastError());
+    GPU_CHECK(hipDeviceSynchronize());
+#endif
+
+    dim3 c2i_threads(16, 16);
+    dim3 c2i_blocks((W + 15) / 16, (H + 15) / 16, N * C_in);
+    col2im_kernel<T><<<c2i_blocks, c2i_threads>>>(
+        d_grad_col, grad_input.data(),
+        N, C_in, H, W, kH, kW, padding, stride, H_out, W_out
+    );
+
+#if defined(USE_CUDA)
+    GPU_CHECK(cudaGetLastError());
+    GPU_CHECK(cudaDeviceSynchronize());
+#elif defined(USE_ROCM)
+    GPU_CHECK(hipGetLastError());
+    GPU_CHECK(hipDeviceSynchronize());
+#endif
+    MemoryPool::get().free(d_grad_col, grad_col_size, Device{DeviceType::CUDA});
+    MemoryPool::get().free(d_weight_T, weight_T_size, Device{DeviceType::CUDA});
 }
 
 template<typename T> 
@@ -775,11 +1351,8 @@ std::pair<Tensor<T>, std::vector<size_t>> max_pool2d_gpu(
 
     // Allocate temporary device memory for the indices
     size_t* d_indices;
-#if defined(USE_CUDA)
-    GPU_CHECK(cudaMalloc(&d_indices, total_out * sizeof(size_t)));
-#elif defined(USE_ROCM)
-    GPU_CHECK(hipMalloc(&d_indices, total_out * sizeof(size_t)));
-#endif
+    size_t idx_size = total_out * sizeof(size_t);
+    d_indices = static_cast<size_t*>(MemoryPool::get().allocate(idx_size, Device{DeviceType::CUDA}));
 
     int threads = 256;
     int blocks = (total_out + threads - 1) / threads;
@@ -799,12 +1372,11 @@ std::pair<Tensor<T>, std::vector<size_t>> max_pool2d_gpu(
 
     std::vector<size_t> h_indices(total_out);
 #if defined(USE_CUDA)
-    GPU_CHECK(cudaMemcpy(h_indices.data(), d_indices, total_out * sizeof(size_t), cudaMemcpyDeviceToHost));
-    GPU_CHECK(cudaFree(d_indices));
+    GPU_CHECK(cudaMemcpy(h_indices.data(), d_indices, idx_size, cudaMemcpyDeviceToHost));
 #elif defined(USE_ROCM)
-    GPU_CHECK(hipMemcpy(h_indices.data(), d_indices, total_out * sizeof(size_t), hipMemcpyDeviceToHost));
-    GPU_CHECK(hipFree(d_indices));
+    GPU_CHECK(hipMemcpy(h_indices.data(), d_indices, idx_size, hipMemcpyDeviceToHost));
 #endif
+    MemoryPool::get().free(d_indices, idx_size, Device{DeviceType::CUDA});
 
     return {output, h_indices};
 }
@@ -821,11 +1393,8 @@ std::pair<Tensor<T>, std::vector<size_t>> max_pool2d_gpu_strided(
     Tensor<T> output({N, C, H_out, W_out}, input.device());
 
     size_t* d_indices;
-#if defined(USE_CUDA)
-    GPU_CHECK(cudaMalloc(&d_indices, total_out * sizeof(size_t)));
-#elif defined(USE_ROCM)
-    GPU_CHECK(hipMalloc(&d_indices, total_out * sizeof(size_t)));
-#endif
+    size_t idx_size = total_out * sizeof(size_t);
+    d_indices = static_cast<size_t*>(MemoryPool::get().allocate(idx_size, Device{DeviceType::CUDA}));
 
     TensorInfo info_in(input.shape(), input.strides());
 
@@ -848,12 +1417,11 @@ std::pair<Tensor<T>, std::vector<size_t>> max_pool2d_gpu_strided(
 
     std::vector<size_t> h_indices(total_out);
 #if defined(USE_CUDA)
-    GPU_CHECK(cudaMemcpy(h_indices.data(), d_indices, total_out * sizeof(size_t), cudaMemcpyDeviceToHost));
-    GPU_CHECK(cudaFree(d_indices));
+    GPU_CHECK(cudaMemcpy(h_indices.data(), d_indices, idx_size, cudaMemcpyDeviceToHost));
 #elif defined(USE_ROCM)
-    GPU_CHECK(hipMemcpy(h_indices.data(), d_indices, total_out * sizeof(size_t), hipMemcpyDeviceToHost));
-    GPU_CHECK(hipFree(d_indices));
+    GPU_CHECK(hipMemcpy(h_indices.data(), d_indices, idx_size, hipMemcpyDeviceToHost));
 #endif
+    MemoryPool::get().free(d_indices, idx_size, Device{DeviceType::CUDA});
 
     return {output, h_indices};
 }
@@ -874,12 +1442,12 @@ void max_pool2d_backward_gpu(
 #endif
 
     size_t* d_indices;
+    size_t idx_size = total_out * sizeof(size_t);
+    d_indices = static_cast<size_t*>(MemoryPool::get().allocate(idx_size, Device{DeviceType::CUDA}));
 #if defined(USE_CUDA)
-    GPU_CHECK(cudaMalloc(&d_indices, total_out * sizeof(size_t)));
-    GPU_CHECK(cudaMemcpy(d_indices, h_indices.data(), total_out * sizeof(size_t), cudaMemcpyHostToDevice));
+    GPU_CHECK(cudaMemcpy(d_indices, h_indices.data(), idx_size, cudaMemcpyHostToDevice));
 #elif defined(USE_ROCM)
-    GPU_CHECK(hipMalloc(&d_indices, total_out * sizeof(size_t)));
-    GPU_CHECK(hipMemcpy(d_indices, h_indices.data(), total_out * sizeof(size_t), hipMemcpyHostToDevice));
+    GPU_CHECK(hipMemcpy(d_indices, h_indices.data(), idx_size, hipMemcpyHostToDevice));
 #endif
 
     int threads = 256;
@@ -897,11 +1465,7 @@ void max_pool2d_backward_gpu(
     GPU_CHECK(hipDeviceSynchronize());
 #endif
 
-#if defined(USE_CUDA)
-    GPU_CHECK(cudaFree(d_indices));
-#elif defined(USE_ROCM)
-    GPU_CHECK(hipFree(d_indices));
-#endif
+    MemoryPool::get().free(d_indices, idx_size, Device{DeviceType::CUDA});
 }
 
 template<typename T>
@@ -943,6 +1507,227 @@ void copy_gpu_strided(const Tensor<T> src, T* dst) {
     GPU_CHECK(cudaGetLastError()); GPU_CHECK(cudaDeviceSynchronize());
 #elif defined(USE_ROCM)
     GPU_CHECK(hipGetLastError()); GPU_CHECK(hipDeviceSynchronize());
+#endif
+}
+
+// #######################################################
+// #   Fused Ops: cross-entropy forward/backward
+// #######################################################
+template<typename T>
+__global__ void cross_entropy_fwd_kernel(
+    const T* logits, const T* targets, T* per_batch_loss,
+    int B, int C
+) {
+    int bid = blockIdx.x;
+    if (bid >= B) return;
+
+    const T* l = logits + bid * C;
+    const T* t = targets + bid * C;
+
+    extern __shared__ __align__(sizeof(T)) unsigned char smem[];
+    T* shared = reinterpret_cast<T*>(smem);
+
+    T max_val = -1e30f;
+    for (int i = threadIdx.x; i < C; i += blockDim.x)
+        max_val = fmax(max_val, l[i]);
+    shared[threadIdx.x] = max_val;
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        __syncthreads();
+        if (threadIdx.x < s)
+            shared[threadIdx.x] = fmax(shared[threadIdx.x], shared[threadIdx.x + s]);
+    }
+    __syncthreads();
+    T batch_max = shared[0];
+    __syncthreads();
+
+    T sum_exp = 0;
+    for (int i = threadIdx.x; i < C; i += blockDim.x)
+        sum_exp += exp(l[i] - batch_max);
+    shared[threadIdx.x] = sum_exp;
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        __syncthreads();
+        if (threadIdx.x < s)
+            shared[threadIdx.x] += shared[threadIdx.x + s];
+    }
+    __syncthreads();
+    T total_exp = shared[0];
+    __syncthreads();
+
+    T loss = 0;
+    for (int i = threadIdx.x; i < C; i += blockDim.x) {
+        T p = exp(l[i] - batch_max) / total_exp;
+        loss += t[i] * log(fmax(p, 1e-30f));
+    }
+    shared[threadIdx.x] = -loss;
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        __syncthreads();
+        if (threadIdx.x < s)
+            shared[threadIdx.x] += shared[threadIdx.x + s];
+    }
+    __syncthreads();
+
+    if (threadIdx.x == 0)
+        per_batch_loss[bid] = shared[0];
+}
+
+template<typename T>
+__global__ void mean_kernel(const T* data, T* result, int N) {
+    extern __shared__ __align__(sizeof(T)) unsigned char smem[];
+    T* shared = reinterpret_cast<T*>(smem);
+
+    T sum = 0;
+    for (int i = threadIdx.x; i < N; i += blockDim.x)
+        sum += data[i];
+    shared[threadIdx.x] = sum;
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        __syncthreads();
+        if (threadIdx.x < s)
+            shared[threadIdx.x] += shared[threadIdx.x + s];
+    }
+    __syncthreads();
+    if (threadIdx.x == 0)
+        result[0] = shared[0] / T(N);
+}
+
+template<typename T>
+__global__ void cross_entropy_bwd_kernel(
+    const T* logits, const T* targets, const T* grad_output,
+    T* grad_logits,
+    int B, int C
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = B * C;
+    if (idx >= total) return;
+
+    int bid = idx / C;
+    int cid = idx % C;
+
+    const T* l = logits + bid * C;
+
+    T max_val = l[0];
+    for (int i = 1; i < C; ++i) max_val = fmax(max_val, l[i]);
+    T sum_exp = 0;
+    for (int i = 0; i < C; ++i) sum_exp += exp(l[i] - max_val);
+    T p = exp(l[cid] - max_val) / sum_exp;
+
+    grad_logits[idx] = (p - targets[idx]) * grad_output[0] / T(B);
+}
+
+template<typename T>
+Tensor<T> cross_entropy_fwd_gpu(const Tensor<T>& logits, const Tensor<T>& targets) {
+    int B = logits.shape()[0];
+    int C = logits.shape()[1];
+
+    Tensor<T> per_batch_loss({static_cast<size_t>(B)}, logits.device());
+    int threads = min(C, 256);
+    // round to power of 2 for tree reduction
+    int pow2 = 1;
+    while (pow2 < threads) pow2 <<= 1;
+    threads = min(pow2, 256);
+    size_t smem = (threads + 1) * sizeof(T);
+
+    cross_entropy_fwd_kernel<T><<<B, threads, smem>>>(
+        logits.data(), targets.data(), per_batch_loss.data(), B, C
+    );
+
+    // Second kernel: reduce per-batch losses to scalar mean
+    Tensor<T> result({1}, logits.device());
+    int r_threads = min(B, 256);
+    pow2 = 1;
+    while (pow2 < r_threads) pow2 <<= 1;
+    r_threads = min(pow2, 256);
+    smem = (r_threads + 1) * sizeof(T);
+    mean_kernel<T><<<1, r_threads, smem>>>(
+        per_batch_loss.data(), result.data(), B
+    );
+
+#if defined(USE_CUDA)
+    GPU_CHECK(cudaGetLastError());
+    GPU_CHECK(cudaDeviceSynchronize());
+#elif defined(USE_ROCM)
+    GPU_CHECK(hipGetLastError());
+    GPU_CHECK(hipDeviceSynchronize());
+#endif
+    return result;
+}
+
+template<typename T>
+void cross_entropy_bwd_gpu(
+    const Tensor<T>& grad_output, const Tensor<T>& logits,
+    const Tensor<T>& targets, Tensor<T>& grad_logits
+) {
+    int B = logits.shape()[0];
+    int C = logits.shape()[1];
+    int total = B * C;
+
+    int threads = 256;
+    int blocks = (total + threads - 1) / threads;
+
+    cross_entropy_bwd_kernel<T><<<blocks, threads>>>(
+        logits.data(), targets.data(), grad_output.data(),
+        grad_logits.data(), B, C
+    );
+
+#if defined(USE_CUDA)
+    GPU_CHECK(cudaGetLastError());
+    GPU_CHECK(cudaDeviceSynchronize());
+#elif defined(USE_ROCM)
+    GPU_CHECK(hipGetLastError());
+    GPU_CHECK(hipDeviceSynchronize());
+#endif
+}
+
+// #######################################################
+// #   Fused Ops: Adam step
+// #######################################################
+template<typename T>
+__global__ void adam_step_kernel(
+    T* param, const T* grad, T* m, T* v,
+    size_t N,
+    T lr, T beta1, T beta2, T eps,
+    T bias_correction1, T bias_correction2,
+    T weight_decay
+) {
+    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= N) return;
+
+    T g = grad[idx];
+    if (weight_decay > T(0))
+        g = g + param[idx] * weight_decay;
+
+    T m_new = beta1 * m[idx] + (T(1.0) - beta1) * g;
+    T v_new = beta2 * v[idx] + (T(1.0) - beta2) * g * g;
+
+    m[idx] = m_new;
+    v[idx] = v_new;
+
+    T m_hat = m_new / bias_correction1;
+    T v_hat = v_new / bias_correction2;
+
+    param[idx] -= lr * m_hat / (sqrt(v_hat) + eps);
+}
+
+template<typename T>
+void adam_step_gpu(
+    Tensor<T>& param, const Tensor<T>& grad, Tensor<T>& m, Tensor<T>& v,
+    T lr, T beta1, T beta2, T eps,
+    T bias_correction1, T bias_correction2, T weight_decay
+) {
+    size_t N = param.total_elements();
+    int threads = 256;
+    int blocks = (N + threads - 1) / threads;
+
+    adam_step_kernel<T><<<blocks, threads>>>(
+        param.data(), grad.data(), m.data(), v.data(),
+        N, lr, beta1, beta2, eps, bias_correction1, bias_correction2, weight_decay
+    );
+
+#if defined(USE_CUDA)
+    GPU_CHECK(cudaGetLastError());
+    GPU_CHECK(cudaDeviceSynchronize());
+#elif defined(USE_ROCM)
+    GPU_CHECK(hipGetLastError());
+    GPU_CHECK(hipDeviceSynchronize());
 #endif
 }
 
@@ -993,3 +1778,7 @@ template void conv2d_backward_weight_gpu<float>(Tensor<float> const&, Tensor<flo
 template void conv2d_backward_bias_gpu<float>(Tensor<float> const&, Tensor<float>&);
 template void max_pool2d_backward_gpu<float>(Tensor<float> const&, Tensor<float>&, std::vector<unsigned long, std::allocator<unsigned long>> const&);
 template void copy_gpu_strided<float>(const Tensor<float> src, float* dst);
+
+template Tensor<float> cross_entropy_fwd_gpu<float>(const Tensor<float>&, const Tensor<float>&);
+template void cross_entropy_bwd_gpu<float>(const Tensor<float>&, const Tensor<float>&, const Tensor<float>&, Tensor<float>&);
+template void adam_step_gpu<float>(Tensor<float>&, const Tensor<float>&, Tensor<float>&, Tensor<float>&, float, float, float, float, float, float, float);
