@@ -47,7 +47,8 @@ if(USE_CUDA AND USE_ROCM)
 endif()
 
 add_library(tensor 
-    src/gpu_ops.cpp
+    # "include/Kernels.cpp"
+    "src/gpu_ops.cpp"
 )
 target_include_directories(tensor PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 if(USE_CUDA)
@@ -60,13 +61,12 @@ find_package(GTest REQUIRED)
 
 add_executable(tensor_tests 
     # test/tensor_test.cpp
-    # test/linear_regression_test.cpp
-    # test/engien_test.cpp
-    # test/nn_test.cpp
     # test/spatial_test.cpp
+    # test/engien_test.cpp
+    test/nn_test.cpp
     # test/func_test.cpp
     # test/dataset_test.cpp
-    test/mnist.cpp
+    # test/mnist.cpp
 )
 target_include_directories(tensor_tests PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 

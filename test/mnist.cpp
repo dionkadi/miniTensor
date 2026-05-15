@@ -131,6 +131,7 @@ int main() {
 
     const size_t batch_size = 64;
     DataLoader<T> train_loader(train_ds, batch_size, /*shuffle=*/true);
+    DataLoader<T> test_loader(test_ds, batch_size, /*shuffle=*/false);
 
     auto model = std::make_shared<Sequential<T>>(
         std::initializer_list<std::shared_ptr<Module<T>>>{
@@ -162,14 +163,14 @@ int main() {
     const int epochs = 5;
     std::cout << std::fixed << std::setprecision(4);
 
-    std::vector<Tensor<T>> test_x_batches, test_y_batches;
-    for (size_t i = 0; i < test_ds.size(); ++i) {
-        auto [x, y] = test_ds.get(i);
-        test_x_batches.push_back(x);
-        test_y_batches.push_back(y);
-    }
-    Tensor<T> test_x = concat(test_x_batches, /*dim=*/0).to(gpu);
-    Tensor<T> test_y = concat(test_y_batches, /*dim=*/0).to(gpu);
+    // std::vector<Tensor<T>> test_x_batches, test_y_batches;
+    // for (size_t i = 0; i < test_ds.size(); ++i) {
+    //     auto [x, y] = test_ds.get(i);
+    //     test_x_batches.push_back(x);
+    //     test_y_batches.push_back(y);
+    // }
+    // Tensor<T> test_x = concat(test_x_batches, /*dim=*/0).to(gpu);
+    // Tensor<T> test_y = concat(test_y_batches, /*dim=*/0).to(gpu);
 
     for (int epoch = 0; epoch < epochs; ++epoch) {
         T running_loss = 0;
@@ -177,7 +178,6 @@ int main() {
         auto start = std::chrono::high_resolution_clock::now();
 
         for (auto [batch_x, batch_y] : train_loader) {
-            // Move batch to GPU
             batch_x = batch_x.to(gpu);
             batch_y = batch_y.to(gpu);
 
@@ -187,22 +187,45 @@ int main() {
             loss.backward();
             optimizer.step();
 
-            running_loss += loss.data()[0];
+            running_loss += loss.to({DeviceType::CPU}).data()[0];
             ++batches;
+            if (batches % 200 == 0) {
+                std::cerr << "  batch " << batches << " avg_loss=" << running_loss / batches << std::endl;
+            }
         }
 
-        // Evaluate on test set (no DataLoader – full batch)
-        auto test_pred = model->forward(test_x);
-        auto test_loss = cross_entropy(test_pred, test_y);
-        auto accuracy = compute_accuracy(test_pred, test_y);
+        // EVALUATION PHASE
+        T test_loss_sum = 0;
+        T test_acc_sum = 0;
+        size_t test_batches = 0;
+
+        {
+            NoGradGuard guard;
+
+            for (auto [batch_x, batch_y] : test_loader) {
+                batch_x = batch_x.to(gpu);
+                batch_y = batch_y.to(gpu);
+
+                auto pred = model->forward(batch_x);
+                auto loss = cross_entropy(pred, batch_y);
+
+                test_loss_sum += loss.to({DeviceType::CPU}).data()[0];
+                // Copy to CPU before computing accuracy
+                test_acc_sum += compute_accuracy(pred.to({DeviceType::CPU}), batch_y.to({DeviceType::CPU}));
+                ++test_batches;
+            }
+        }
+
+        T avg_test_loss = test_loss_sum / test_batches;
+        T avg_test_acc = test_acc_sum / test_batches;
 
         auto end = std::chrono::high_resolution_clock::now();
         double sec = std::chrono::duration<double>(end - start).count();
 
         std::cout << "Epoch " << epoch + 1 << "/" << epochs
                   << " | train loss: " << running_loss / batches
-                  << " | test loss: " << test_loss.data()[0]
-                  << " | test acc: " << std::setprecision(2) << accuracy * 100 << "%"
+                  << " | test loss: " << avg_test_loss
+                  << " | test acc: " << std::setprecision(2) << avg_test_acc * 100 << "%"
                   << " | time: " << sec << "s\n";
     }
 

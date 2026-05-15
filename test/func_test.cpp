@@ -22,7 +22,7 @@ void expect_tensor_data(const Tensor<T>& t, const std::vector<T>& expected) {
     // Ensure we are reading contiguous data for the test comparison
     Tensor<T> contig_t = cpu_t.contiguous();
     
-    const T* ptr = contig_t.data();
+    const T* ptr = contig_t.data() + contig_t.offset();
     for (size_t i = 0; i < expected.size(); ++i) {
         EXPECT_FLOAT_EQ(ptr[i], expected[i]) << "Mismatch at flat index " << i;
     }
