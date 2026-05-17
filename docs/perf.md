@@ -212,3 +212,6 @@ Remaining bottlenecks are dominated by **GPU kernel execution time** (~3ms per k
 | sgemm launches/conv | 64 | 1 | **~64×** |
 | Data copy | pageable | pinned | 2-5× faster |
 | Compilation flags | `-O0` | `-O2` | 5-10× kernel perf |
+
+
+---
