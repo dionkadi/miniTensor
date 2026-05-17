@@ -1799,6 +1799,49 @@ __global__ void mean_kernel(const T* data, T* result, int N) {
 }
 
 template<typename T>
+__global__ void softmax_fwd_kernel(T* output, const T* input, int C) {
+    int bid = blockIdx.x;
+    const T* row_in = input + bid * C;
+    T* row_out = output + bid * C;
+
+    extern __shared__ __align__(sizeof(T)) unsigned char smem[];
+    T* shared = reinterpret_cast<T*>(smem);
+
+    T max_val = -1e30f;
+    for (int i = threadIdx.x; i < C; i += blockDim.x)
+        max_val = fmax(max_val, row_in[i]);
+    shared[threadIdx.x] = max_val;
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        __syncthreads();
+        if (threadIdx.x < s)
+            shared[threadIdx.x] = fmax(shared[threadIdx.x], shared[threadIdx.x + s]);
+    }
+    __syncthreads();
+    T batch_max = shared[0];
+    __syncthreads();
+
+    T sum_exp = 0;
+    for (int i = threadIdx.x; i < C; i += blockDim.x) {
+        T e = exp(row_in[i] - batch_max);
+        row_out[i] = e;
+        sum_exp += e;
+    }
+    shared[threadIdx.x] = sum_exp;
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        __syncthreads();
+        if (threadIdx.x < s)
+            shared[threadIdx.x] += shared[threadIdx.x + s];
+    }
+    __syncthreads();
+    T total_exp = shared[0];
+    __syncthreads();
+
+    T inv_sum = T(1) / total_exp;
+    for (int i = threadIdx.x; i < C; i += blockDim.x)
+        row_out[i] *= inv_sum;
+}
+
+template<typename T>
 __global__ void cross_entropy_bwd_kernel(
     const T* logits, const T* targets, const T* grad_output,
     T* grad_logits,
@@ -1890,6 +1933,34 @@ void cross_entropy_bwd_gpu(
 #elif defined(USE_ROCM)
     GPU_CHECK(hipGetLastError());
 #endif
+}
+
+template<typename T>
+Tensor<T> softmax_gpu(const Tensor<T>& input) {
+    auto shape = input.shape();
+    int B = input.total_elements() / shape.back();
+    int C = shape.back();
+
+    Tensor<T> output(shape, input.device());
+
+    if (B == 0) return output;
+
+    int threads = min(C, 256);
+    int pow2 = 1;
+    while (pow2 < threads) pow2 <<= 1;
+    threads = min(pow2, 256);
+    size_t smem = (threads + 1) * sizeof(T);
+
+    softmax_fwd_kernel<T><<<B, threads, smem>>>(
+        output.data(), input.data(), C
+    );
+
+#if defined(USE_CUDA)
+    GPU_CHECK(cudaGetLastError());
+#elif defined(USE_ROCM)
+    GPU_CHECK(hipGetLastError());
+#endif
+    return output;
 }
 
 // #######################################################
@@ -1996,3 +2067,4 @@ template void copy_gpu_strided<float>(const Tensor<float> src, float* dst);
 template Tensor<float> cross_entropy_fwd_gpu<float>(const Tensor<float>&, const Tensor<float>&);
 template void cross_entropy_bwd_gpu<float>(const Tensor<float>&, const Tensor<float>&, const Tensor<float>&, Tensor<float>&);
 template void adam_step_gpu<float>(Tensor<float>&, const Tensor<float>&, Tensor<float>&, Tensor<float>&, float, float, float, float, float, float, float);
+template Tensor<float> softmax_gpu<float>(const Tensor<float>&);

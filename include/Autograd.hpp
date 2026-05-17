@@ -503,6 +503,54 @@ struct Conv2DBackward : public AutogradNode<T> {
 };
 
 template<typename T>
+struct DropoutBackward : public AutogradNode<T> {
+    SavedTensor<T> saved_input;
+    Tensor<T> mask;
+    T p;
+
+    DropoutBackward(Tensor<T> input, Tensor<T> mask, T p)
+        : saved_input(input), mask(mask), p(p) {}
+
+    void apply(const Tensor<T>& grad_output) override {
+        NoGradGuard guard;
+        Tensor<T> input = saved_input.unpack();
+        if (input.requires_grad()) {
+            T scale = T(1) / (T(1) - p);
+            input.accumulate_grad(grad_output * mask * scale);
+        }
+    }
+
+    std::vector<Tensor<T>> get_inputs() const override {
+        return {saved_input.unpack()};
+    }
+};
+
+template<typename T>
+struct SoftmaxBackward : public AutogradNode<T> {
+    SavedTensor<T> saved_output;  // softmax output
+
+    SoftmaxBackward(Tensor<T> output) : saved_output(output) {}
+
+    void apply(const Tensor<T>& grad_output) override {
+        NoGradGuard guard;
+        Tensor<T> s = saved_output.unpack();
+
+        if (s.requires_grad()) {
+            // dL/dx = s * (grad_output - sum(grad_output * s, axis=-1, keepdims))
+            // where s = softmax(x)
+            Tensor<T> ds = grad_output * s;                         // grad_output * s
+            Tensor<T> sum_ds = sum(ds, s.shape().size() - 1, true); // sum along last dim
+            Tensor<T> grad = s * (grad_output - sum_ds);            // s * (grad_output - sum)
+            s.accumulate_grad(grad);
+        }
+    }
+
+    std::vector<Tensor<T>> get_inputs() const override {
+        return {saved_output.unpack()};
+    }
+};
+
+template<typename T>
 struct CrossEntropyBackward : public AutogradNode<T> {
     SavedTensor<T> saved_logits;
     SavedTensor<T> saved_targets;

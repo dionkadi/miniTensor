@@ -2,6 +2,7 @@
 
 #include "Autograd.hpp"
 #include <cstddef>
+#include <algorithm>
 
 // Macro to seamlessly compile functors for both Host (CPU) and Device (GPU)
 #ifndef HD_INLINE
@@ -515,6 +516,36 @@ void max_pool2d_backward_cpu(const Tensor<T>& grad_output, Tensor<T>& grad_input
 }
 
 template<typename T>
+Tensor<T> softmax_cpu(const Tensor<T>& input) {
+    auto shape = input.shape();
+    size_t last_dim = shape.back();
+    size_t outer = input.total_elements() / last_dim;
+
+    Tensor<T> output(input.shape(), input.device());
+    const T* in_ptr = input.data() + input.offset();
+    T* out_ptr = output.data() + output.offset();
+
+    for (size_t i = 0; i < outer; ++i) {
+        const T* row_in = in_ptr + i * last_dim;
+        T* row_out = out_ptr + i * last_dim;
+
+        T max_val = *std::max_element(row_in, row_in + last_dim);
+
+        T sum = 0;
+        for (size_t j = 0; j < last_dim; ++j) {
+            row_out[j] = exp(row_in[j] - max_val);
+            sum += row_out[j];
+        }
+
+        T inv_sum = T(1) / sum;
+        for (size_t j = 0; j < last_dim; ++j) {
+            row_out[j] *= inv_sum;
+        }
+    }
+    return output;
+}
+
+template<typename T>
 void copy_cpu_strided(const Tensor<T> src, T* dst) {
     size_t total_elements = src.total_elements();
 
@@ -677,6 +708,7 @@ template<typename T> void copy_gpu_strided(const Tensor<T> src, T* dst);
 template<typename T> Tensor<T> cross_entropy_fwd_gpu(const Tensor<T>&, const Tensor<T>&);
 template<typename T> void cross_entropy_bwd_gpu(const Tensor<T>&, const Tensor<T>&, const Tensor<T>&, Tensor<T>&);
 template<typename T> void adam_step_gpu(Tensor<T>& param, const Tensor<T>& grad, Tensor<T>& m, Tensor<T>& v, T lr, T beta1, T beta2, T eps, T bias_correction1, T bias_correction2, T weight_decay);
+template<typename T> Tensor<T> softmax_gpu(const Tensor<T>& input);
 #endif
 
 // #############################
@@ -874,6 +906,66 @@ Tensor<T> flatten(const Tensor<T>& x) {
 template<typename T> void sub_(Tensor<T>& A, const Tensor<T>& B) { dispatch_binary_inplace(A, B, SubOp<T>{}); }
 template<typename T> void add_(Tensor<T>& A, const Tensor<T>& B) { dispatch_binary_inplace(A, B, AddOp<T>{}); }
 template<typename T> void mul_(Tensor<T>& A, const Tensor<T>& B) { dispatch_binary_inplace(A, B, MulOp<T>{}); }
+
+template<typename T>
+Tensor<T> bmm(const Tensor<T>& A, const Tensor<T>& B) {
+    // A: [B, M, K], B: [B, K, N] -> C: [B, M, N]
+    if (A.device() != B.device())
+        throw std::invalid_argument("Tensors must be on the same device for bmm.");
+    if (A.shape().size() != 3 || B.shape().size() != 3)
+        throw std::invalid_argument("bmm requires 3D tensors.");
+    if (A.shape()[0] != B.shape()[0])
+        throw std::invalid_argument("bmm: batch dimension mismatch.");
+    if (A.shape()[2] != B.shape()[1])
+        throw std::invalid_argument("bmm: inner dimension mismatch (A.K != B.K).");
+
+    size_t B_dim = A.shape()[0];
+    size_t M = A.shape()[1];
+    size_t K = A.shape()[2];
+    size_t N = B.shape()[2];
+
+    Tensor<T> C({B_dim, M, N}, A.device());
+    auto A_contig = A.contiguous();
+    auto B_contig = B.contiguous();
+    auto C_contig = C.contiguous();
+
+    for (size_t b = 0; b < B_dim; ++b) {
+        size_t offset_A = b * M * K;
+        size_t offset_B = b * K * N;
+        size_t offset_C = b * M * N;
+
+        // Create 2D views for each batch
+        auto A_slice = Tensor<T>(std::make_shared<TensorImpl<T>>(
+            A_contig.impl_->storage_, std::vector<size_t>{M, K},
+            std::vector<size_t>{K, 1}, A_contig.offset() + offset_A
+        ));
+        auto B_slice = Tensor<T>(std::make_shared<TensorImpl<T>>(
+            B_contig.impl_->storage_, std::vector<size_t>{K, N},
+            std::vector<size_t>{N, 1}, B_contig.offset() + offset_B
+        ));
+        auto C_slice = Tensor<T>(std::make_shared<TensorImpl<T>>(
+            C_contig.impl_->storage_, std::vector<size_t>{M, N},
+            std::vector<size_t>{N, 1}, C_contig.offset() + offset_C
+        ));
+
+        // matmul the 2D slices — works on CPU and GPU
+        if (A.device().type == DeviceType::CPU) {
+            matmul_cpu(A_slice, B_slice, C_slice);
+        } else {
+#if defined(USE_CUDA) || defined(USE_ROCM)
+            matmul_gpu(A_slice, B_slice, C_slice);
+#else
+            throw std::runtime_error("GPU not supported");
+#endif
+        }
+    }
+
+    if (GradMode::is_enabled() && (A.requires_grad() || B.requires_grad())) {
+        C.set_requires_grad(true);
+        C.set_grad_fn(std::make_shared<MatmulBackward<T>>(A, B));
+    }
+    return C;
+}
 
 template<typename T>
 Tensor<T> matmul(const Tensor<T>& A, const Tensor<T>& B) {
@@ -1110,6 +1202,35 @@ Tensor<T> sigmoid(const Tensor<T>& A) {
 template<typename T> 
 Tensor<T> tanh(const Tensor<T>& A) { 
     return dispatch_unary<T, TanhOp<T>, TanhBackward<T>>(A, TanhOp<T>{}); 
+}
+
+template<typename T>
+Tensor<T> softmax(const Tensor<T>& input) {
+    Tensor<T> output;
+
+    switch (input.device().type) {
+        case DeviceType::CPU: {
+            output = softmax_cpu(input);
+            break;
+        }
+        case DeviceType::CUDA: {
+#if defined(USE_CUDA) || defined(USE_ROCM)
+            output = softmax_gpu(input);
+#else
+            throw std::runtime_error("Library was not compiled with GPU support!");
+#endif
+            break;
+        }
+        default:
+            throw std::runtime_error("Unknown device type.");
+    }
+
+    if (GradMode::is_enabled() && input.requires_grad()) {
+        output.set_requires_grad(true);
+        output.set_grad_fn(std::make_shared<SoftmaxBackward<T>>(output));
+    }
+
+    return output;
 }
 
 template<typename T> 

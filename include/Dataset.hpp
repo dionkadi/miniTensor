@@ -6,6 +6,11 @@
 #include <vector>
 #include <random>
 #include <algorithm>
+#include <queue>
+#include <mutex>
+#include <condition_variable>
+#include <thread>
+#include <atomic>
 
 #include "TensorOps.hpp"
 
@@ -59,6 +64,121 @@ std::pair<Tensor<T>, Tensor<T>> default_collate(const std::vector<std::pair<Tens
     return { concat(batch_features, 0), concat(batch_labels, 0) };
 }
 
+
+template<typename T>
+class ThreadSafeQueue {
+    std::queue<T> q_;
+    mutable std::mutex mtx_;
+    std::condition_variable cv_;
+    bool done_ = false;
+public:
+    void push(T item) {
+        std::lock_guard<std::mutex> lock(mtx_);
+        q_.push(std::move(item));
+        cv_.notify_one();
+    }
+
+    bool pop(T& item) {
+        std::unique_lock<std::mutex> lock(mtx_);
+        cv_.wait(lock, [this] { return !q_.empty() || done_; });
+        if (q_.empty()) return false;
+        item = std::move(q_.front());
+        q_.pop();
+        return true;
+    }
+
+    void done() {
+        std::lock_guard<std::mutex> lock(mtx_);
+        done_ = true;
+        cv_.notify_all();
+    }
+
+    bool empty() const {
+        std::lock_guard<std::mutex> lock(mtx_);
+        return q_.empty();
+    }
+};
+
+template<typename T>
+class AsyncDataLoader {
+    const Dataset<T>& dataset_;
+    size_t batch_size_;
+    bool shuffle_;
+    std::vector<size_t> indices_;
+    size_t current_idx_ = 0;
+    ThreadSafeQueue<std::pair<Tensor<T>, Tensor<T>>> queue_;
+    std::thread worker_;
+    std::atomic<bool> running_{false};
+    size_t prefetch_count_;
+
+    void prefetch_worker() {
+        while (running_ && current_idx_ < indices_.size()) {
+            size_t end_idx = std::min(current_idx_ + batch_size_, indices_.size());
+            std::vector<std::pair<Tensor<T>, Tensor<T>>> batch_items;
+            for (size_t i = current_idx_; i < end_idx; ++i) {
+                batch_items.push_back(dataset_.get(indices_[i]));
+            }
+            current_idx_ = end_idx;
+            queue_.push(default_collate(batch_items));
+        }
+        queue_.done();
+    }
+
+public:
+    AsyncDataLoader(const Dataset<T>& dataset, size_t batch_size,
+                    bool shuffle = true, size_t prefetch = 2)
+        : dataset_(dataset), batch_size_(batch_size),
+          shuffle_(shuffle), prefetch_count_(prefetch) {
+        indices_.resize(dataset_.size());
+        std::iota(indices_.begin(), indices_.end(), 0);
+    }
+
+    ~AsyncDataLoader() { stop(); }
+
+    void stop() {
+        running_ = false;
+        queue_.done();
+        if (worker_.joinable()) worker_.join();
+    }
+
+    class Iterator {
+        AsyncDataLoader* loader_;
+        std::pair<Tensor<T>, Tensor<T>> current_;
+        bool valid_ = false;
+    public:
+        Iterator(AsyncDataLoader* loader, bool begin) : loader_(loader) {
+            if (begin) {
+                if (loader_->queue_.pop(current_)) valid_ = true;
+            }
+        }
+
+        bool operator!=(const Iterator& other) const { return valid_ || other.valid_; }
+
+        Iterator& operator++() {
+            if (loader_->queue_.pop(current_)) {
+                valid_ = true;
+            } else {
+                valid_ = false;
+            }
+            return *this;
+        }
+
+        std::pair<Tensor<T>, Tensor<T>> operator*() const { return current_; }
+    };
+
+    Iterator begin() {
+        if (shuffle_) {
+            std::mt19937 g(std::random_device{}());
+            std::shuffle(indices_.begin(), indices_.end(), g);
+        }
+        current_idx_ = 0;
+        running_ = true;
+        worker_ = std::thread(&AsyncDataLoader::prefetch_worker, this);
+        return Iterator(this, true);
+    }
+
+    Iterator end() { return Iterator(this, false); }
+};
 
 template<typename T>
 class DataLoader {

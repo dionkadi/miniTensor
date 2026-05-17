@@ -12,11 +12,16 @@ template<typename T> class Tensor;
 template<typename T>
 class Module {
 public:
+    bool is_training_ = true;
+
     virtual ~Module() = default;
     
     virtual Tensor<T> forward(const Tensor<T>& x) = 0;
     virtual std::vector<Tensor<T>> parameters() const = 0; 
     virtual void to(Device) {}
+
+    void train() { is_training_ = true; }
+    void eval()  { is_training_ = false; }
 
     Tensor<T> operator()(const Tensor<T>& x) {
         return forward(x);
@@ -130,6 +135,16 @@ public:
             mod->to(device);
         }
     }
+
+    void train() {
+        this->is_training_ = true;
+        for (auto& mod : modules_) mod->train();
+    }
+
+    void eval() {
+        this->is_training_ = false;
+        for (auto& mod : modules_) mod->eval();
+    }
 };
 
 template<typename T>
@@ -192,6 +207,142 @@ public:
             bias_ = bias_.to(device);
         }
     }
+};
+
+template<typename T>
+class LayerNorm : public Module<T> {
+    Tensor<T> gamma_;
+    Tensor<T> beta_;
+    T eps_;
+public:
+    LayerNorm(const std::vector<size_t>& normalized_shape, T eps = T(1e-5), Device device = {})
+        : eps_(eps) {
+        size_t d = normalized_shape.back();
+        gamma_ = Tensor<T>({d}, device);
+        gamma_.set_requires_grad(true);
+        gamma_.fill(T(1));
+        beta_ = Tensor<T>({d}, device);
+        beta_.set_requires_grad(true);
+        beta_.fill(T(0));
+    }
+
+    Tensor<T> forward(const Tensor<T>& x) override {
+        size_t last_dim = x.shape().size() - 1;
+        T d = T(x.shape().back());
+
+        auto mean = sum(x, last_dim, true) / d;
+        auto centered = x - mean;
+        auto var = sum(pow2(centered), last_dim, true) / d;
+        auto x_hat = centered / sqrt(var + eps_);
+        return x_hat * gamma_ + beta_;
+    }
+
+    std::vector<Tensor<T>> parameters() const override { return {gamma_, beta_}; }
+
+    void to(Device device) override {
+        gamma_ = gamma_.to(device);
+        beta_ = beta_.to(device);
+    }
+};
+
+template<typename T>
+class BatchNorm2d : public Module<T> {
+    Tensor<T> gamma_;
+    Tensor<T> beta_;
+    Tensor<T> running_mean_;
+    Tensor<T> running_var_;
+    T eps_;
+    T momentum_;
+public:
+    BatchNorm2d(size_t num_features, T eps = T(1e-5), T momentum = T(0.9), Device device = {})
+        : eps_(eps), momentum_(momentum) {
+        gamma_ = Tensor<T>({num_features}, device);
+        gamma_.set_requires_grad(true);
+        gamma_.fill(T(1));
+        beta_ = Tensor<T>({num_features}, device);
+        beta_.set_requires_grad(true);
+        beta_.fill(T(0));
+        running_mean_ = Tensor<T>({num_features}, device);
+        running_mean_.fill(T(0));
+        running_var_ = Tensor<T>({num_features}, device);
+        running_var_.fill(T(1));
+    }
+
+    Tensor<T> forward(const Tensor<T>& x) override {
+        // x: [N, C, H, W]
+        size_t N = x.shape()[0], C = x.shape()[1], H = x.shape()[2], W = x.shape()[3];
+        T spatial_size = T(N * H * W);
+
+        auto mean = sum(x, 0, true);         // [1, C, 1, 1]
+        mean = sum(mean, 2, true);            // [1, C, 1, 1]
+        mean = sum(mean, 3, true);            // [1, C, 1, 1]
+        mean = mean / spatial_size;
+
+        auto centered = x - mean;
+        auto var = sum(pow2(centered), 0, true);
+        var = sum(var, 2, true);
+        var = sum(var, 3, true);
+        var = var / spatial_size;
+
+        if (this->is_training_) {
+            NoGradGuard guard;
+            running_mean_ = running_mean_ * momentum_ + mean.reshape({C}) * (T(1) - momentum_);
+            running_var_  = running_var_  * momentum_ + var.reshape({C})  * (T(1) - momentum_);
+        }
+
+        auto inv_std = sqrt(var + eps_);     // [1, C, 1, 1]
+        auto x_hat = centered / inv_std;
+        return x_hat * gamma_.reshape({1, C, 1, 1}) + beta_.reshape({1, C, 1, 1});
+    }
+
+    std::vector<Tensor<T>> parameters() const override {
+        return {gamma_, beta_};
+    }
+
+    void to(Device device) override {
+        gamma_ = gamma_.to(device);
+        beta_ = beta_.to(device);
+        running_mean_ = running_mean_.to(device);
+        running_var_ = running_var_.to(device);
+    }
+};
+
+template<typename T>
+class Dropout : public Module<T> {
+    T p_;
+public:
+    Dropout(T p = T(0.5)) : p_(p) {}
+
+    Tensor<T> forward(const Tensor<T>& x) override {
+        if (!this->is_training_ || p_ <= T(0)) {
+            return x;
+        }
+
+        T p_keep = T(1) - p_;
+        std::mt19937 gen(std::random_device{}());
+        std::bernoulli_distribution dist(p_keep);
+
+        Tensor<T> mask(x.shape(), x.device());
+        T* m_data = mask.data();
+        for (size_t i = 0; i < mask.total_elements(); ++i) {
+            m_data[i] = dist(gen) ? T(1) : T(0);
+        }
+
+        if (x.device().type != DeviceType::CPU) {
+            mask = mask.to(x.device());
+        }
+
+        Tensor<T> result = x * mask * (T(1) / p_keep);
+
+        if (GradMode::is_enabled() && x.requires_grad()) {
+            result.set_requires_grad(true);
+            result.set_grad_fn(std::make_shared<DropoutBackward<T>>(x, mask, p_));
+        }
+
+        return result;
+    }
+
+    std::vector<Tensor<T>> parameters() const override { return {}; }
 };
 
 template<typename T>
