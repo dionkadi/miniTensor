@@ -93,5 +93,3 @@ void load_state_dict_into(const std::string& path, std::vector<Tensor<T>>& targe
         }
     }
 }
-    }
-}

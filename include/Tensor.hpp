@@ -36,6 +36,7 @@ public:
     Self expand(const std::vector<size_t>& target_shape) const { return impl_->expand(target_shape); }
     Self reshape(const std::vector<size_t>& new_shape) const { return impl_->reshape(new_shape); }
     Self to(Device target_device) const { return impl_->to(target_device); }
+    Dtype dtype() const noexcept { return dtype_of<T>(); }
     Self contiguous() const {
         if (is_contiguous() && offset() == 0) {
             return *this;
@@ -64,7 +65,8 @@ public:
             impl_->storage_,
             std::move(new_shape),
             strides(),
-            new_offset
+            new_offset,
+            requires_grad()
         );
         return Tensor<T>(new_impl);
     }

@@ -19,6 +19,7 @@ public:
     virtual Tensor<T> forward(const Tensor<T>& x) = 0;
     virtual std::vector<Tensor<T>> parameters() const = 0; 
     virtual void to(Device) {}
+    virtual const char* name() const { return "Module"; }
 
     void train() { is_training_ = true; }
     void eval()  { is_training_ = false; }
@@ -30,6 +31,9 @@ public:
 
 template<typename T>
 class ReLU : public Module<T> {
+public:
+    const char* name() const override { return "ReLU"; }
+
 public:
     Tensor<T> forward(const Tensor<T>& x) override {
         return relu(x);
@@ -43,6 +47,9 @@ public:
 template<typename T>
 class Tanh : public Module<T> {
 public:
+    const char* name() const override { return "Tanh"; }
+
+public:
     Tensor<T> forward(const Tensor<T>& x) override {
         return tanh(x);
     }
@@ -55,6 +62,9 @@ public:
 template<typename T>
 class Sigmoid : public Module<T> {
 public:
+    const char* name() const override { return "Sigmoid"; }
+
+public:
     Tensor<T> forward(const Tensor<T>& x) override {
         return sigmoid(x);
     }
@@ -66,6 +76,9 @@ public:
 
 template<typename T>
 class Linear : public Module<T> {
+public:
+    const char* name() const override { return "Linear"; }
+
     Tensor<T> weight_;
     Tensor<T> bias_;
 
@@ -105,6 +118,9 @@ public:
 
 template<typename T>
 class Sequential : public Module<T> {
+public:
+    const char* name() const override { return "Sequential"; }
+
 private:
     std::vector<std::shared_ptr<Module<T>>> modules_;
 
@@ -112,6 +128,15 @@ public:
     Sequential(std::initializer_list<std::shared_ptr<Module<T>>> modules) 
         : modules_(modules) 
     {}
+
+    void add(std::shared_ptr<Module<T>> mod) {
+        modules_.push_back(std::move(mod));
+    }
+
+    template<typename U, typename... Args>
+    void add(Args&&... args) {
+        modules_.push_back(std::make_shared<U>(std::forward<Args>(args)...));
+    }
 
     Tensor<T> forward(const Tensor<T>& x) override {
         Tensor<T> current_out = x;
@@ -145,10 +170,15 @@ public:
         this->is_training_ = false;
         for (auto& mod : modules_) mod->eval();
     }
+
+    const std::vector<std::shared_ptr<Module<T>>>& modules() const { return modules_; }
 };
 
 template<typename T>
 class Flatten : public Module<T> {
+public:
+    const char* name() const override { return "Flatten"; }
+
 public:
     Tensor<T> forward(const Tensor<T>& x) override {
         return flatten(x);
@@ -161,6 +191,9 @@ public:
 
 template<typename T>
 class Conv2D : public Module<T> {
+public:
+    const char* name() const override { return "Conv2D"; }
+
     Tensor<T> weight_;
     Tensor<T> bias_;  // may be empty if bias=false
     size_t stride_, padding_;
@@ -211,6 +244,9 @@ public:
 
 template<typename T>
 class LayerNorm : public Module<T> {
+public:
+    const char* name() const override { return "LayerNorm"; }
+
     Tensor<T> gamma_;
     Tensor<T> beta_;
     T eps_;
@@ -247,6 +283,9 @@ public:
 
 template<typename T>
 class BatchNorm2d : public Module<T> {
+public:
+    const char* name() const override { return "BatchNorm2d"; }
+
     Tensor<T> gamma_;
     Tensor<T> beta_;
     Tensor<T> running_mean_;
@@ -273,16 +312,16 @@ public:
         size_t N = x.shape()[0], C = x.shape()[1], H = x.shape()[2], W = x.shape()[3];
         T spatial_size = T(N * H * W);
 
-        auto mean = sum(x, 0, true);         // [1, C, 1, 1]
-        mean = sum(mean, 2, true);            // [1, C, 1, 1]
-        mean = sum(mean, 3, true);            // [1, C, 1, 1]
-        mean = mean / spatial_size;
+        auto mean = sum(x, 0, true);
+        mean = sum(mean, 2, true);
+        mean = sum(mean, 3, true);
+        mean = mean * (T(1) / spatial_size);
 
         auto centered = x - mean;
         auto var = sum(pow2(centered), 0, true);
         var = sum(var, 2, true);
         var = sum(var, 3, true);
-        var = var / spatial_size;
+        var = var * (T(1) / spatial_size);
 
         if (this->is_training_) {
             NoGradGuard guard;
@@ -309,6 +348,9 @@ public:
 
 template<typename T>
 class Dropout : public Module<T> {
+public:
+    const char* name() const override { return "Dropout"; }
+
     T p_;
 public:
     Dropout(T p = T(0.5)) : p_(p) {}
@@ -347,6 +389,9 @@ public:
 
 template<typename T>
 class MaxPool2D : public Module<T> {
+public:
+    const char* name() const override { return "MaxPool2D"; }
+
     size_t kernel_size_, stride_, padding_;
     
 public:

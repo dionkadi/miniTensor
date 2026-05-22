@@ -15,6 +15,9 @@ public:
 
     virtual void step() = 0;
 
+    std::vector<Tensor<T>>& get_parameters() { return parameters_; }
+    const std::vector<Tensor<T>>& get_parameters() const { return parameters_; }
+
     void zero_grad() {
         for (auto& p : parameters_) {
             p.zero_grad();
@@ -117,4 +120,47 @@ public:
             sub_(p, step_size);
         }
     }
+};
+
+template<typename T>
+class GradientScaler {
+public:
+    GradientScaler(T init_scale = 65536.0, T growth_factor = 2.0,
+                   T backoff_factor = 0.5, size_t growth_interval = 2000)
+        : scale_(init_scale), growth_factor_(growth_factor),
+          backoff_factor_(backoff_factor), growth_interval_(growth_interval),
+          step_count_(0) {}
+
+    T scale_loss(T loss) const { return loss * scale_; }
+
+    bool update(bool overflow_occurred) {
+        if (overflow_occurred) {
+            scale_ *= backoff_factor_;
+            step_count_ = 0;
+            return false;
+        }
+        step_count_++;
+        if (step_count_ >= growth_interval_) {
+            scale_ *= growth_factor_;
+            step_count_ = 0;
+        }
+        return true;
+    }
+
+    void unscale_gradients(Optimizer<T>& optimizer) {
+        for (auto& p : optimizer.get_parameters()) {
+            if (!p.grad().empty()) {
+                p.grad() = p.grad() * (T(1) / scale_);
+            }
+        }
+    }
+
+    T scale() const { return scale_; }
+
+private:
+    T scale_;
+    T growth_factor_;
+    T backoff_factor_;
+    size_t growth_interval_;
+    size_t step_count_;
 };
