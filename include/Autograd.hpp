@@ -574,3 +574,128 @@ struct CrossEntropyBackward : public AutogradNode<T> {
         return {saved_logits.unpack()};
     }
 };
+
+// ---------------------------------------------------------------
+// View Backward Nodes
+// ---------------------------------------------------------------
+
+template<typename T>
+struct SliceBackward : public AutogradNode<T> {
+    SavedTensor<T> saved_original;
+    size_t dim_, start_, end_;
+    std::vector<size_t> orig_shape_;
+
+    SliceBackward(Tensor<T> original, size_t d, size_t s, size_t e)
+        : saved_original(original), dim_(d), start_(s), end_(e),
+          orig_shape_(original.shape()) {}
+
+    void apply(const Tensor<T>& grad_output) override {
+        NoGradGuard guard;
+        Tensor<T> original = saved_original.unpack();
+        if (original.requires_grad()) {
+            // Create a zero gradient of the original shape, then copy the
+            // slice gradient into the sliced region.  Works for any dim.
+            Tensor<T> grad(orig_shape_, original.device());
+            grad.fill(T(0));
+
+            // Make grad contiguous so we can flat-index it.
+            Tensor<T> grad_contig = grad.contiguous();
+            Tensor<T> go_contig    = grad_output.contiguous();
+
+            T*       dst = grad_contig.data();
+            const T* src = go_contig.data();
+
+            size_t ndim       = orig_shape_.size();
+            size_t inner_size = 1;
+            for (size_t i = dim_ + 1; i < ndim; ++i)
+                inner_size *= orig_shape_[i];
+
+            size_t outer_size = 1;
+            for (size_t i = 0; i < dim_; ++i)
+                outer_size *= orig_shape_[i];
+
+            size_t slice_len = inner_size * (end_ - start_);
+
+            // Walk all outer dimensions, copy the contiguous slice region.
+            // Original contiguous layout: each outer index advances by
+            // (orig_shape[dim_] * inner_size) elements.
+            size_t outer_stride = orig_shape_[dim_] * inner_size;
+
+            for (size_t o = 0; o < outer_size; ++o) {
+                size_t dst_off = o * outer_stride + start_ * inner_size;
+                const T* src_ptr = src + o * slice_len;
+                std::copy(src_ptr, src_ptr + slice_len, dst + dst_off);
+            }
+
+            original.accumulate_grad(grad);
+        }
+    }
+
+    std::vector<Tensor<T>> get_inputs() const override {
+        return {saved_original.unpack()};
+    }
+};
+
+template<typename T>
+struct TransposeBackward : public AutogradNode<T> {
+    SavedTensor<T> saved_original;
+    size_t dim0_, dim1_;
+
+    TransposeBackward(Tensor<T> original, size_t d0, size_t d1)
+        : saved_original(original), dim0_(d0), dim1_(d1) {}
+
+    void apply(const Tensor<T>& grad_output) override {
+        NoGradGuard guard;
+        Tensor<T> original = saved_original.unpack();
+        if (original.requires_grad()) {
+            Tensor<T> grad = grad_output.transpose(dim0_, dim1_);
+            original.accumulate_grad(grad);
+        }
+    }
+
+    std::vector<Tensor<T>> get_inputs() const override {
+        return {saved_original.unpack()};
+    }
+};
+
+template<typename T>
+struct ReshapeBackward : public AutogradNode<T> {
+    SavedTensor<T> saved_original;
+
+    explicit ReshapeBackward(Tensor<T> original) : saved_original(original) {}
+
+    void apply(const Tensor<T>& grad_output) override {
+        NoGradGuard guard;
+        Tensor<T> original = saved_original.unpack();
+        if (original.requires_grad()) {
+            Tensor<T> grad = grad_output.reshape(original.shape());
+            original.accumulate_grad(grad);
+        }
+    }
+
+    std::vector<Tensor<T>> get_inputs() const override {
+        return {saved_original.unpack()};
+    }
+};
+
+template<typename T>
+struct ExpandBackward : public AutogradNode<T> {
+    SavedTensor<T> saved_original;
+    std::vector<size_t> original_shape_;
+
+    ExpandBackward(Tensor<T> original, std::vector<size_t> orig_shape)
+        : saved_original(original), original_shape_(std::move(orig_shape)) {}
+
+    void apply(const Tensor<T>& grad_output) override {
+        NoGradGuard guard;
+        Tensor<T> original = saved_original.unpack();
+        if (original.requires_grad()) {
+            Tensor<T> grad = unbroadcast(grad_output, original_shape_);
+            original.accumulate_grad(grad);
+        }
+    }
+
+    std::vector<Tensor<T>> get_inputs() const override {
+        return {saved_original.unpack()};
+    }
+};

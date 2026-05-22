@@ -1311,3 +1311,43 @@ Tensor<T> unbroadcast(Tensor<T> grad, const std::vector<size_t>& target_shape) {
 
     return result;
 }
+
+// ---------------------------------------------------------------
+// Autograd‑aware view operations
+// ---------------------------------------------------------------
+
+template<typename T>
+Tensor<T> view_slice(const Tensor<T>& x, size_t dim, size_t start, size_t end) {
+    Tensor<T> result = x.slice(dim, start, end);
+    if (GradMode::is_enabled() && x.requires_grad()) {
+        result.set_grad_fn(std::make_shared<SliceBackward<T>>(x, dim, start, end));
+    }
+    return result;
+}
+
+template<typename T>
+Tensor<T> view_transpose(const Tensor<T>& x, size_t dim0, size_t dim1) {
+    Tensor<T> result = x.transpose(dim0, dim1);
+    if (GradMode::is_enabled() && x.requires_grad()) {
+        result.set_grad_fn(std::make_shared<TransposeBackward<T>>(x, dim0, dim1));
+    }
+    return result;
+}
+
+template<typename T>
+Tensor<T> view_reshape(const Tensor<T>& x, const std::vector<size_t>& new_shape) {
+    Tensor<T> result = x.reshape(new_shape);
+    if (GradMode::is_enabled() && x.requires_grad()) {
+        result.set_grad_fn(std::make_shared<ReshapeBackward<T>>(x));
+    }
+    return result;
+}
+
+template<typename T>
+Tensor<T> view_expand(const Tensor<T>& x, const std::vector<size_t>& target_shape) {
+    Tensor<T> result = x.expand(target_shape);
+    if (GradMode::is_enabled() && x.requires_grad()) {
+        result.set_grad_fn(std::make_shared<ExpandBackward<T>>(x, x.shape()));
+    }
+    return result;
+}
