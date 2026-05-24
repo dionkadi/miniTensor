@@ -214,8 +214,7 @@ public:
         auto identity = x;
         
         auto out = conv1_.forward(x);
-        out = bn1_.forward(out);
-        out = relu(out);
+        out = bn1_.forward_relu(out);
         
         out = conv2_.forward(out);
         out = bn2_.forward(out);
@@ -319,8 +318,7 @@ public:
     Tensor<T> forward(const Tensor<T>& x) override {
         // Initial conv: 84x84 -> 42x42
         auto out = conv1_.forward(x);
-        out = bn1_.forward(out);
-        out = relu(out);
+        out = bn1_.forward_relu(out);
         
         // MaxPool: 42x42 -> 21x21
         out = maxpool_.forward(out);
@@ -700,6 +698,19 @@ int main() {
     T best_val_acc = T(0);
     std::string best_weights_path = "best_resnet10.bin";
     
+    // CUDA Graphs state
+    bool buffers_init = false;
+    Tensor<T> bx_gpu, by_gpu;
+    hipGraphExec_t graphExec = nullptr;
+    hipGraph_t graphHandle = nullptr;
+    bool use_graph = false;
+    bool capture_attempted = false;
+    int warmup_done = 0;
+    const int warmup_batches = 2;
+    Tensor<T> graph_loss_;
+    hipStream_t graph_stream = nullptr;
+    GPU_CHECK(hipStreamCreateWithFlags(&graph_stream, hipStreamNonBlocking));
+    
     std::cout << "\n[3] Training for " << epochs << " epochs..." << std::endl;
     std::cout << std::fixed << std::setprecision(4);
     
@@ -715,56 +726,127 @@ int main() {
             size_t this_batch = train_batches + 1;
             auto t_total = std::chrono::high_resolution_clock::now();
             
-            // Data transfer: CPU -> GPU
-            auto t_d2h_cpu = std::chrono::high_resolution_clock::now();
-            bx = bx.to(gpu);
-            by = by.to(gpu);
-            auto t_d2h_gpu = std::chrono::high_resolution_clock::now();
+            // ---- Init persistent GPU buffers (from first batch shape) ----
+            if (!buffers_init) {
+                bx_gpu = Tensor<T>(bx.shape(), Device{DeviceType::CUDA});
+                by_gpu = Tensor<T>(by.shape(), Device{DeviceType::CUDA});
+                buffers_init = true;
+            }
             
-            // Zero gradients
+            // ---- Data transfer: CPU -> persistent GPU buffers ----
+            auto t_data_start = std::chrono::high_resolution_clock::now();
+            GPU_CHECK(hipMemcpy(bx_gpu.data(), bx.data(),
+                                bx.total_elements() * sizeof(T), hipMemcpyHostToDevice));
+            GPU_CHECK(hipMemcpy(by_gpu.data(), by.data(),
+                                by.total_elements() * sizeof(T), hipMemcpyHostToDevice));
+            auto t_data_done = std::chrono::high_resolution_clock::now();
+            
+            // Zero gradients always outside graph (hipMemset doesn't take a stream)
             auto t_zg = std::chrono::high_resolution_clock::now();
             optimizer.zero_grad();
+            (void)hipStreamSynchronize(nullptr);  // flush default stream before capture
             auto t_zero_done = std::chrono::high_resolution_clock::now();
             
-            // Forward pass
-            auto t_fwd_start = std::chrono::high_resolution_clock::now();
-            auto pred = model->forward(bx);
-            auto t_fwd_done = std::chrono::high_resolution_clock::now();
-            
-            // Loss
-            auto t_loss_start = std::chrono::high_resolution_clock::now();
-            auto loss = cross_entropy(pred, by);
-            auto t_loss_done = std::chrono::high_resolution_clock::now();
-            
-            // Backward pass
-            auto t_bwd_start = std::chrono::high_resolution_clock::now();
-            loss.backward();
-            auto t_bwd_done = std::chrono::high_resolution_clock::now();
-            
-            // Optimizer step
-            auto t_opt_start = std::chrono::high_resolution_clock::now();
-            optimizer.step();
-            auto t_opt_done = std::chrono::high_resolution_clock::now();
-            
-            // Loss transfer: GPU -> CPU (includes implicit sync)
-            auto t_h2d_start = std::chrono::high_resolution_clock::now();
-            train_loss += loss.to({DeviceType::CPU}).data()[0];
-            auto t_h2d_done = std::chrono::high_resolution_clock::now();
-            
-            ++train_batches;
-            auto t_total_end = std::chrono::high_resolution_clock::now();
-            
-            using dbl_sec = std::chrono::duration<double>;
-            auto to_ms = [](auto d) { return std::chrono::duration_cast<std::chrono::milliseconds>(d).count(); };
-            
-            std::cout << std::format("batch {} ({}ms total): "
-                "data:{}ms zero:{}ms fwd:{}ms loss:{}ms bwd:{}ms opt:{}ms h2d:{}ms | avg_loss:{:.4f}\n",
-                this_batch, to_ms(t_total_end - t_total),
-                to_ms(t_d2h_gpu - t_d2h_cpu), to_ms(t_zero_done - t_zg),
-                to_ms(t_fwd_done - t_fwd_start), to_ms(t_loss_done - t_loss_start),
-                to_ms(t_bwd_done - t_bwd_start), to_ms(t_opt_done - t_opt_start),
-                to_ms(t_h2d_done - t_h2d_start),
-                train_loss / train_batches);
+            if (use_graph) {
+                auto t_gpu_start = std::chrono::high_resolution_clock::now();
+                GPU_CHECK(hipGraphLaunch(graphExec, graph_stream));
+                auto t_gpu_done = std::chrono::high_resolution_clock::now();
+                
+                auto t_opt_start = std::chrono::high_resolution_clock::now();
+                (void)hipStreamSynchronize(graph_stream);
+                optimizer.step();
+                auto t_opt_done = std::chrono::high_resolution_clock::now();
+                
+                auto t_h2d_start = std::chrono::high_resolution_clock::now();
+                train_loss += graph_loss_.to({DeviceType::CPU}).data()[0];
+                auto t_h2d_done = std::chrono::high_resolution_clock::now();
+                
+                ++train_batches;
+                auto t_total_end = std::chrono::high_resolution_clock::now();
+                
+                using dbl_sec = std::chrono::duration<double>;
+                auto to_ms = [](auto d) { return std::chrono::duration_cast<std::chrono::milliseconds>(d).count(); };
+                
+                std::cout << std::format("batch {} ({}ms total) [GRAPH]: "
+                    "zero:{}ms data:{}ms gpu:{}ms opt:{}ms h2d:{}ms | avg_loss:{:.4f}\n",
+                    this_batch, to_ms(t_total_end - t_total),
+                    to_ms(t_zero_done - t_zg), to_ms(t_data_done - t_data_start),
+                    to_ms(t_gpu_done - t_gpu_start),
+                    to_ms(t_opt_done - t_opt_start), to_ms(t_h2d_done - t_h2d_start),
+                    train_loss / train_batches);
+            } else {
+                bool capturing = false;
+                if (warmup_done >= warmup_batches && !capture_attempted) {
+                    capture_attempted = true;
+                    active_stream() = graph_stream;
+                    capturing = (hipStreamBeginCapture(graph_stream, hipStreamCaptureModeRelaxed) == hipSuccess);
+                    if (!capturing) {
+                        std::cout << "  [HIP Graphs: capture unavailable, running normally]\n";
+                        active_stream() = nullptr;
+                    }
+                }
+                
+                auto t_fwd_start = std::chrono::high_resolution_clock::now();
+                auto pred = model->forward(bx_gpu);
+                auto t_fwd_done = std::chrono::high_resolution_clock::now();
+                
+                auto t_loss_start = std::chrono::high_resolution_clock::now();
+                auto loss = cross_entropy(pred, by_gpu);
+                auto t_loss_done = std::chrono::high_resolution_clock::now();
+                
+                auto t_bwd_start = std::chrono::high_resolution_clock::now();
+                loss.backward();
+                auto t_bwd_done = std::chrono::high_resolution_clock::now();
+                
+                // End capture BEFORE optimizer step (correct t_ evolution)
+                if (capturing) {
+                    hipGraph_t g;
+                    hipError_t cap_err = hipStreamEndCapture(graph_stream, &g);
+                    if (cap_err == hipSuccess) {
+                        hipError_t inst_err = hipGraphInstantiate(&graphExec, g, nullptr, nullptr, 0);
+                        if (inst_err == hipSuccess) {
+                            use_graph = true;
+                            graphHandle = g;
+                            graph_loss_ = loss;
+                            std::cout << "  [CUDA Graphs: capture OK, switching to graph replay]\n";
+                        } else {
+                            (void)hipGraphDestroy(g);
+                            active_stream() = nullptr;
+                        }
+                    }
+                    if (!use_graph) {
+                        std::cout << "  [CUDA Graphs: capture FAILED (err=" << cap_err
+                                  << "), running normally]\n";
+                        active_stream() = nullptr;
+                    }
+                    capturing = false;
+                }
+                
+                // Optimizer always outside capture for correct t_ evolution
+                auto t_opt_start = std::chrono::high_resolution_clock::now();
+                optimizer.step();
+                auto t_opt_done = std::chrono::high_resolution_clock::now();
+                
+                auto t_h2d_start = std::chrono::high_resolution_clock::now();
+                train_loss += loss.to({DeviceType::CPU}).data()[0];
+                auto t_h2d_done = std::chrono::high_resolution_clock::now();
+                
+                ++train_batches;
+                warmup_done++;
+                auto t_total_end = std::chrono::high_resolution_clock::now();
+                
+                using dbl_sec = std::chrono::duration<double>;
+                auto to_ms = [](auto d) { return std::chrono::duration_cast<std::chrono::milliseconds>(d).count(); };
+                
+                std::cout << std::format("batch {} ({}ms total): "
+                    "data:{}ms zero:{}ms fwd:{}ms loss:{}ms bwd:{}ms opt:{}ms h2d:{}ms | avg_loss:{:.4f}\n",
+                    this_batch, to_ms(t_total_end - t_total),
+                    to_ms(t_data_done - t_data_start), to_ms(t_zero_done - t_zg),
+                    to_ms(t_fwd_done - t_fwd_start), to_ms(t_loss_done - t_loss_start),
+                    to_ms(t_bwd_done - t_bwd_start), to_ms(t_opt_done - t_opt_start),
+                    to_ms(t_h2d_done - t_h2d_start),
+                    train_loss / train_batches);
+            }
         }
         
         T avg_train_loss = train_loss / train_batches;
@@ -829,6 +911,10 @@ int main() {
     
     // Export ONNX (simplified format)
     export_onnx("resnet10.onnx.txt", *model, {1, 3, 84, 84});
+    
+    if (graphExec) (void)hipGraphExecDestroy(graphExec);
+    if (graphHandle) (void)hipGraphDestroy(graphHandle);
+    if (graph_stream) (void)hipStreamDestroy(graph_stream);
     
     std::cout << "\n=== Training Complete ===" << std::endl;
     

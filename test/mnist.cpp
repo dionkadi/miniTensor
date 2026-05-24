@@ -1,6 +1,7 @@
 #include "Dataset.hpp"
 #include "Tensor.hpp"
 #include <fstream>
+#include <memory>
 #include <stdexcept>
 #include <cstdint>
 #include "Tensor.hpp"
@@ -139,14 +140,18 @@ int main() {
         std::initializer_list<std::shared_ptr<Module<T>>>{
             // Conv1: 1 -> 16, kernel 3, pad 1  -> [N, 16, 28, 28]
             std::make_shared<Conv2D<T>>(1, 16, 3, 1, 1),
+            std::make_shared<BatchNorm2d<T>>(16),
             std::make_shared<ReLU<T>>(),
+
             // Conv2: 16 -> 32, kernel 3, pad 1 -> [N, 32, 28, 28]
             std::make_shared<Conv2D<T>>(16, 32, 3, 1, 1),
+            std::make_shared<BatchNorm2d<T>>(32),
             std::make_shared<ReLU<T>>(),
             std::make_shared<MaxPool2D<T>>(2), // [N, 32, 14, 14]
 
             // Conv3: 32 -> 64, kernel 3, pad 1 -> [N, 64, 14, 14]
             std::make_shared<Conv2D<T>>(32, 64, 3, 1, 1),
+            std::make_shared<BatchNorm2d<T>>(64),
             std::make_shared<ReLU<T>>(),
             std::make_shared<MaxPool2D<T>>(2), // [N, 64, 7, 7]
 
