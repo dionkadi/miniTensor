@@ -9,6 +9,8 @@
 
 #include "TensorImpl.hpp"
 
+template<typename T> void add_(Tensor<T>& A, const Tensor<T>& B);
+
 template<typename T>
 class Tensor {
 public:
@@ -94,7 +96,7 @@ public:
         if (impl_->grad_.empty()) {
             impl_->grad_ = gradient;
         } else {
-            impl_->grad_ = impl_->grad_ + gradient;
+            add_(impl_->grad_, gradient);
         }
     }
     std::shared_ptr<AutogradNode<T>> grad_fn() const noexcept { return impl_->grad_fn_; }
