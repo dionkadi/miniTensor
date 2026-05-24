@@ -700,15 +700,18 @@ template<typename T> void conv2d_gpu_strided(const Tensor<T>& input, const Tenso
 template<typename T> void conv2d_backward_input_gpu(const Tensor<T>& grad_output, const Tensor<T>& weight, Tensor<T>& grad_input, size_t stride, size_t padding);
 template<typename T> void conv2d_backward_weight_gpu(const Tensor<T>& grad_output, const Tensor<T>& input, Tensor<T>& grad_weight, size_t stride, size_t padding);
 template<typename T> void conv2d_backward_bias_gpu(const Tensor<T>& grad_output, Tensor<T>& grad_bias);
-template<typename T> std::pair<Tensor<T>, std::vector<size_t>> max_pool2d_gpu(const Tensor<T>& input, size_t k, size_t stride, size_t padding);
-template<typename T> std::pair<Tensor<T>, std::vector<size_t>> max_pool2d_gpu_strided(const Tensor<T>& input, size_t k, size_t stride, size_t padding);
-template<typename T> void max_pool2d_backward_gpu(const Tensor<T>& grad_output, Tensor<T>& grad_input, const std::vector<size_t>& h_indices);
-template<typename T> void max_pool2d_backward_gpu_strided(const Tensor<T>& grad_output, Tensor<T>& grad_input, const std::vector<size_t>& h_indices);
+template<typename T> std::pair<Tensor<T>, Tensor<size_t>> max_pool2d_gpu(const Tensor<T>& input, size_t k, size_t stride, size_t padding);
+template<typename T> std::pair<Tensor<T>, Tensor<size_t>> max_pool2d_gpu_strided(const Tensor<T>& input, size_t k, size_t stride, size_t padding);
+template<typename T> void max_pool2d_backward_gpu(const Tensor<T>& grad_output, Tensor<T>& grad_input, const Tensor<size_t>& d_indices);
+template<typename T> void max_pool2d_backward_gpu_strided(const Tensor<T>& grad_output, Tensor<T>& grad_input, const Tensor<size_t>& d_indices);
 template<typename T> void copy_gpu_strided(const Tensor<T> src, T* dst);
 template<typename T> Tensor<T> cross_entropy_fwd_gpu(const Tensor<T>&, const Tensor<T>&);
 template<typename T> void cross_entropy_bwd_gpu(const Tensor<T>&, const Tensor<T>&, const Tensor<T>&, Tensor<T>&);
 template<typename T> void adam_step_gpu(Tensor<T>& param, const Tensor<T>& grad, Tensor<T>& m, Tensor<T>& v, T lr, T beta1, T beta2, T eps, T bias_correction1, T bias_correction2, T weight_decay);
 template<typename T> Tensor<T> softmax_gpu(const Tensor<T>& input);
+template<typename T> void add_relu_gpu(const Tensor<T>& A, const Tensor<T>& B, Tensor<T>& C);
+template<typename T> void bn_fwd_gpu(const Tensor<T>& input, Tensor<T>& mean, Tensor<T>& var);
+template<typename T> void bn_relu_fwd_gpu(const Tensor<T>& input, Tensor<T>& output, const Tensor<T>& mean, const Tensor<T>& var, const Tensor<T>& gamma, const Tensor<T>& beta, T eps);
 #endif
 
 // #############################
@@ -1139,31 +1142,38 @@ Tensor<T> max_pool2d(const Tensor<T>& input, size_t kernel_size, size_t stride, 
         if (input.is_contiguous()) {
             auto res = max_pool2d_cpu(input, kernel_size, stride, padding);
             output = res.first;
-            indices = res.second;
+            if (GradMode::is_enabled() && input.requires_grad()) {
+                output.set_requires_grad(true);
+                output.set_grad_fn(std::make_shared<MaxPool2DBackward<T>>(input, std::move(res.second)));
+            }
         } else {
             auto res = max_pool2d_cpu_strided(input, kernel_size, stride, padding);
             output = res.first;
-            indices = res.second;
+            if (GradMode::is_enabled() && input.requires_grad()) {
+                output.set_requires_grad(true);
+                output.set_grad_fn(std::make_shared<MaxPool2DBackward<T>>(input, std::move(res.second)));
+            }
         }
     } else {
 #if defined(USE_CUDA) || defined(USE_ROCM)
         if (input.is_contiguous()) {
             auto res = max_pool2d_gpu(input, kernel_size, stride, padding);
             output = res.first;
-            indices = res.second;
+            if (GradMode::is_enabled() && input.requires_grad()) {
+                output.set_requires_grad(true);
+                output.set_grad_fn(std::make_shared<MaxPool2DBackward<T>>(input, std::move(res.second)));
+            }
         } else {
             auto res = max_pool2d_gpu_strided(input, kernel_size, stride, padding);
             output = res.first;
-            indices = res.second;
+            if (GradMode::is_enabled() && input.requires_grad()) {
+                output.set_requires_grad(true);
+                output.set_grad_fn(std::make_shared<MaxPool2DBackward<T>>(input, std::move(res.second)));
+            }
         }
 #else
         throw std::runtime_error("Library was not compiled with GPU support!");
 #endif
-    }
-
-    if (GradMode::is_enabled() && input.requires_grad()) {
-        output.set_requires_grad(true);
-        output.set_grad_fn(std::make_shared<MaxPool2DBackward<T>>(input, indices));
     }
     
     return output;
@@ -1171,15 +1181,18 @@ Tensor<T> max_pool2d(const Tensor<T>& input, size_t kernel_size, size_t stride, 
 
 template<typename T>
 void max_pool2d_backward(const Tensor<T>& grad_output, Tensor<T>& grad_input, const std::vector<size_t>& indices) {
-    if (grad_input.device() == DeviceType::CPU) {
-        max_pool2d_backward_cpu(grad_output, grad_input, indices);
-    } else {
+    if (grad_input.device().type != DeviceType::CPU)
+        throw std::runtime_error("max_pool2d_backward(vector) for GPU: use Tensor<size_t> overload");
+    max_pool2d_backward_cpu(grad_output, grad_input, indices);
+}
+
+template<typename T>
+void max_pool2d_backward(const Tensor<T>& grad_output, Tensor<T>& grad_input, const Tensor<size_t>& indices) {
 #if defined(USE_CUDA) || defined(USE_ROCM)
-        max_pool2d_backward_gpu(grad_output, grad_input, indices); 
+    max_pool2d_backward_gpu(grad_output, grad_input, indices); 
 #else
-        throw std::runtime_error("Library was not compiled with GPU support!");
+    throw std::runtime_error("GPU not supported");
 #endif
-    }
 }
 
 template<typename T> 
@@ -1350,4 +1363,36 @@ Tensor<T> view_expand(const Tensor<T>& x, const std::vector<size_t>& target_shap
         result.set_grad_fn(std::make_shared<ExpandBackward<T>>(x, x.shape()));
     }
     return result;
+}
+
+template<typename T>
+Tensor<T> add_relu(const Tensor<T>& a, const Tensor<T>& b) {
+    if (a.device() != b.device())
+        throw std::invalid_argument("Device mismatch for add_relu.");
+    auto out_shape = compute_broadcast_shape(a.shape(), b.shape());
+    Tensor<T> A = a.expand(out_shape);
+    Tensor<T> B = b.expand(out_shape);
+    Tensor<T> C(out_shape, a.device());
+
+    if (a.device().type == DeviceType::CPU) {
+        T* c_ptr = C.data();
+        const T* a_ptr = A.data();
+        const T* b_ptr = B.data();
+        for (size_t i = 0; i < C.total_elements(); ++i) {
+            T val = a_ptr[i] + b_ptr[i];
+            c_ptr[i] = val > T(0) ? val : T(0);
+        }
+    } else {
+#if defined(USE_CUDA) || defined(USE_ROCM)
+        add_relu_gpu(A, B, C);
+#else
+        throw std::runtime_error("GPU not supported for add_relu");
+#endif
+    }
+
+    if (GradMode::is_enabled() && (a.requires_grad() || b.requires_grad())) {
+        C.set_requires_grad(true);
+        C.set_grad_fn(std::make_shared<AddReLUBackward<T>>(A, B));
+    }
+    return C;
 }

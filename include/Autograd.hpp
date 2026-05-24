@@ -438,10 +438,16 @@ struct FlattenBackward : public AutogradNode<T> {
 template<typename T>
 struct MaxPool2DBackward : public AutogradNode<T> {
     SavedTensor<T> saved_input;
-    std::vector<size_t> indices;
+    // CPU path uses host vector, GPU path uses device tensor (no host copy)
+    std::vector<size_t> cpu_indices;
+    Tensor<size_t> gpu_indices;
+    bool is_gpu;
 
     MaxPool2DBackward(Tensor<T> input, std::vector<size_t> idxs) 
-        : saved_input(input), indices(std::move(idxs)) {}
+        : saved_input(input), cpu_indices(std::move(idxs)), is_gpu(false) {}
+
+    MaxPool2DBackward(Tensor<T> input, Tensor<size_t> idxs)
+        : saved_input(input), gpu_indices(std::move(idxs)), is_gpu(true) {}
 
     void apply(const Tensor<T>& grad_output) override {
         NoGradGuard guard;
@@ -449,7 +455,11 @@ struct MaxPool2DBackward : public AutogradNode<T> {
         auto go = grad_output.contiguous();
         if (input.requires_grad()) {
             Tensor<T> grad_input(input.shape(), input.device());
-            max_pool2d_backward(go, grad_input, indices);
+            if (is_gpu) {
+                max_pool2d_backward_gpu(go, grad_input, gpu_indices);
+            } else {
+                max_pool2d_backward_cpu(go, grad_input, cpu_indices);
+            }
             input.accumulate_grad(grad_input);
         }
     }
@@ -499,6 +509,35 @@ struct Conv2DBackward : public AutogradNode<T> {
 
     std::vector<Tensor<T>> get_inputs() const override { 
         return {saved_input.unpack(), saved_weight.unpack(), saved_bias.unpack()}; 
+    }
+};
+
+template<typename T>
+struct AddReLUBackward : public AutogradNode<T> {
+    SavedTensor<T> saved_a;
+    SavedTensor<T> saved_b;
+
+    AddReLUBackward(Tensor<T> a, Tensor<T> b) : saved_a(a), saved_b(b) {}
+
+    void apply(const Tensor<T>& grad_output) override {
+        NoGradGuard guard;
+        Tensor<T> a = saved_a.unpack();
+        Tensor<T> b = saved_b.unpack();
+        // mask = grad_output * ((a+b) > 0)
+        // Recompute sum and compute ReLU gradient
+        auto sum = add(a, b);
+        auto mask = relu_grad(sum, grad_output);
+
+        if (a.requires_grad()) {
+            a.accumulate_grad(unbroadcast(mask, a.shape()));
+        }
+        if (b.requires_grad()) {
+            b.accumulate_grad(unbroadcast(mask, b.shape()));
+        }
+    }
+
+    std::vector<Tensor<T>> get_inputs() const override {
+        return {saved_a.unpack(), saved_b.unpack()};
     }
 };
 
