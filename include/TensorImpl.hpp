@@ -47,20 +47,37 @@ public:
             
             if (val == (T)0) {
 #if defined(USE_CUDA)
-                GPU_CHECK(cudaMemset(data_.get(), (T)0, bytes));
+                if (active_stream()) {
+                    GPU_CHECK(cudaMemsetAsync(data_.get(), 0, bytes, active_stream()));
+                } else {
+                    GPU_CHECK(cudaMemset(data_.get(), 0, bytes));
+                }
 #elif defined(USE_ROCM)
-                GPU_CHECK(hipMemset(data_.get(), (T)0, bytes));
+                if (active_stream()) {
+                    GPU_CHECK(hipMemsetAsync(data_.get(), 0, bytes, active_stream()));
+                } else {
+                    GPU_CHECK(hipMemset(data_.get(), 0, bytes));
+                }
 #endif
             } else {
-                // GPU Tensors: memset only works correctly for zeroing bytes. 
-                // For non-zero floats (like 1.0f for gradients), the safest/easiest 
-                // way without writing a custom fill_kernel is to do a Host-to-Device copy.
                 std::vector<T> temp(size_, val);
     
 #if defined(USE_CUDA)
-                GPU_CHECK(cudaMemcpy(data_.get(), temp.data(), bytes, cudaMemcpyHostToDevice));
+                if (active_stream()) {
+                    GPU_CHECK(cudaMemcpyAsync(data_.get(), temp.data(), bytes,
+                                              cudaMemcpyHostToDevice, active_stream()));
+                } else {
+                    GPU_CHECK(cudaMemcpy(data_.get(), temp.data(), bytes,
+                                         cudaMemcpyHostToDevice));
+                }
 #elif defined(USE_ROCM)
-                GPU_CHECK(hipMemcpy(data_.get(), temp.data(), bytes, hipMemcpyHostToDevice));
+                if (active_stream()) {
+                    GPU_CHECK(hipMemcpyAsync(data_.get(), temp.data(), bytes,
+                                             hipMemcpyHostToDevice, active_stream()));
+                } else {
+                    GPU_CHECK(hipMemcpy(data_.get(), temp.data(), bytes,
+                                        hipMemcpyHostToDevice));
+                }
 #endif
             }
         }
