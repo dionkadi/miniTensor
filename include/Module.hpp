@@ -308,31 +308,67 @@ public:
     }
 
     Tensor<T> forward(const Tensor<T>& x) override {
-        // x: [N, C, H, W]
+        return forward_impl(x, false);
+    }
+
+    // Fused BN + ReLU: single kernel replaces BN forward + relu call.
+    // Gradient flows through separate BN backward + ReLU backward nodes
+    // (autograd graph is built correctly even though forward is fused).
+    Tensor<T> forward_relu(const Tensor<T>& x) {
+        return forward_impl(x, true);
+    }
+
+private:
+    Tensor<T> forward_impl(const Tensor<T>& x, bool apply_relu) {
         size_t N = x.shape()[0], C = x.shape()[1], H = x.shape()[2], W = x.shape()[3];
         T spatial_size = T(N * H * W);
 
-        auto mean = sum(x, 0, true);
-        mean = sum(mean, 2, true);
-        mean = sum(mean, 3, true);
-        mean = mean * (T(1) / spatial_size);
+        Tensor<T> mean, var;
+#if defined(USE_CUDA) || defined(USE_ROCM)
+        if (x.device().type == DeviceType::CUDA) {
+            // Fused BN forward: single kernel computes mean + var
+            mean = Tensor<T>({1, C, 1, 1}, x.device());
+            var  = Tensor<T>({1, C, 1, 1}, x.device());
+            bn_fwd_gpu(x, mean, var);
+        } else {
+#endif
+            mean = sum(x, 0, true);
+            mean = sum(mean, 2, true);
+            mean = sum(mean, 3, true);
+            mean = mean * (T(1) / spatial_size);
 
-        auto centered = x - mean;
-        auto var = sum(pow2(centered), 0, true);
-        var = sum(var, 2, true);
-        var = sum(var, 3, true);
-        var = var * (T(1) / spatial_size);
-
+            auto centered = x - mean;
+            var = sum(pow2(centered), 0, true);
+            var = sum(var, 2, true);
+            var = sum(var, 3, true);
+            var = var * (T(1) / spatial_size);
+#if defined(USE_CUDA) || defined(USE_ROCM)
+        }
+#endif
         if (this->is_training_) {
             NoGradGuard guard;
             running_mean_ = running_mean_ * momentum_ + mean.reshape({C}) * (T(1) - momentum_);
             running_var_  = running_var_  * momentum_ + var.reshape({C})  * (T(1) - momentum_);
         }
 
-        auto inv_std = sqrt(var + eps_);     // [1, C, 1, 1]
+#if defined(USE_CUDA) || defined(USE_ROCM)
+        if (apply_relu && x.device().type == DeviceType::CUDA && !GradMode::is_enabled()) {
+            Tensor<T> output(x.shape(), x.device());
+            bn_relu_fwd_gpu(x, output, mean, var, gamma_, beta_, eps_);
+            return output;
+        }
+#endif
+
+        auto centered = x - mean;
+        auto inv_std = sqrt(var + eps_);
         auto x_hat = centered / inv_std;
-        return x_hat * gamma_.reshape({1, C, 1, 1}) + beta_.reshape({1, C, 1, 1});
+        auto bn_out = x_hat * view_reshape(gamma_, {1, C, 1, 1}) + view_reshape(beta_, {1, C, 1, 1});
+        if (apply_relu) {
+            return relu(bn_out);
+        }
+        return bn_out;
     }
+public:
 
     std::vector<Tensor<T>> parameters() const override {
         return {gamma_, beta_};
