@@ -36,6 +36,22 @@ using GpuEvent_t  = cudaEvent_t;
     } while (0)
 
 inline hipStream_t default_hip_stream() { return nullptr; }
+
+// Thread-local stream override for graph capture — set during capture,
+// nullptr otherwise. Kernel launches use this if non-null.
+inline hipStream_t& active_stream() {
+    thread_local hipStream_t s = nullptr;
+    return s;
+}
+
+// Capture-safe variant — hipGetLastError returns hipErrorStreamCaptureUnsupported
+// during stream capture even if the kernel launched fine. We ignore it since
+// warmup runs verify valid launch args before capture.
+inline hipError_t get_last_error_capture_safe() {
+    hipError_t err = hipGetLastError();
+    if (err == hipErrorStreamCaptureUnsupported) return hipSuccess;
+    return err;
+}
 using GpuStream_t = hipStream_t;
 using GpuEvent_t  = hipEvent_t;
 
