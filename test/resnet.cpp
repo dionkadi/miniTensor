@@ -11,6 +11,8 @@
 #include "Serialization.hpp"
 #include "GraphExport.hpp"
 #include "Functional.hpp"
+#include "GraphExecutor.hpp"
+#include "Scheduler.hpp"
 
 #include <format>
 #include <fstream>
@@ -24,6 +26,7 @@
 #include <map>
 #include <dirent.h>
 #include <sys/stat.h>
+#include <csignal>
 
 // STB image loader (single-header library)
 #define STB_IMAGE_IMPLEMENTATION
@@ -299,6 +302,7 @@ public:
     
     size_t fc_in_features_;
     Linear<T> fc_;
+    AdaptiveAvgPool2D<T> avg_pool_;
     
     ResNet10(int num_classes = 100, Device device = {})
         : conv1_(3, 64, 7, 2, 3, true, device),  // 84x84 -> 42x42
@@ -311,7 +315,8 @@ public:
           layer3_block1_(128, 256, 2, device),    // 11x11 -> 6x6
           layer3_block2_(256, 256, 1, device),
           fc_in_features_(256),
-          fc_(fc_in_features_, num_classes, device)
+          fc_(fc_in_features_, num_classes, device),
+          avg_pool_(1)
     {
     }
     
@@ -336,7 +341,7 @@ public:
         out = layer3_block2_.forward(out);
         
         // Global average pooling: [N, 256, 6, 6] -> [N, 256, 1, 1]
-        out = adaptive_avg_pool2d(out, 1);
+        out = avg_pool_.forward(out);
         
         // Flatten: [N, 256, 1, 1] -> [N, 256]
         out = flatten(out);
@@ -407,86 +412,6 @@ public:
 };
 
 // ============================================================================
-// Adaptive Average Pooling 2D
-// ============================================================================
-
-// Backward node for adaptive avg pool
-template<typename T>
-class AdaptiveAvgPool2DBackward : public AutogradNode<T> {
-    SavedTensor<T> saved_input_;
-    int orig_H_, orig_W_;
-public:
-    AdaptiveAvgPool2DBackward(const Tensor<T>& input, int H, int W)
-        : saved_input_(input), orig_H_(H), orig_W_(W) {}
-    
-    void apply(const Tensor<T>& grad_output) override {
-        NoGradGuard guard;
-        Tensor<T> input = saved_input_.unpack();
-        if (!input.requires_grad()) return;
-        
-        Tensor<T> grad_input(input.shape(), input.device());
-        T scale = T(1) / T(orig_H_ * orig_W_);
-        const T* g = grad_output.data();
-        T* out = grad_input.data();
-        
-        auto shape = input.shape();
-        size_t N = shape[0], C = shape[1];
-        
-        for (size_t n = 0; n < N; ++n) {
-            for (size_t c = 0; c < C; ++c) {
-                T val = g[n * C + c] * scale;
-                for (int h = 0; h < orig_H_; ++h) {
-                    for (int w = 0; w < orig_W_; ++w) {
-                        out[n * C * orig_H_ * orig_W_ + c * orig_H_ * orig_W_ + h * orig_W_ + w] = val;
-                    }
-                }
-            }
-        }
-        
-        input.accumulate_grad(grad_input);
-    }
-    
-    std::vector<Tensor<T>> get_inputs() const override {
-        return {saved_input_.unpack()};
-    }
-};
-
-template<typename T>
-Tensor<T> adaptive_avg_pool2d(const Tensor<T>& x, int output_size) {
-    auto shape = x.shape();
-    size_t N = shape[0], C = shape[1], H = shape[2], W = shape[3];
-    
-    if (output_size == 1) {
-        Tensor<T> out({N, C, size_t(1), size_t(1)}, x.device());
-        out.fill(T(0));
-        
-        T* out_data = out.data();
-        const T* in_data = x.data();
-        
-        for (size_t n = 0; n < N; ++n) {
-            for (size_t c = 0; c < C; ++c) {
-                float sum = 0;
-                for (size_t h = 0; h < H; ++h) {
-                    for (size_t w = 0; w < W; ++w) {
-                        sum += in_data[n * C * H * W + c * H * W + h * W + w];
-                    }
-                }
-                out_data[n * C + c] = sum / T(H * W);
-            }
-        }
-        
-        if (GradMode::is_enabled() && x.requires_grad()) {
-            out.set_requires_grad(true);
-            out.set_grad_fn(std::make_shared<AdaptiveAvgPool2DBackward<T>>(x, static_cast<int>(H), static_cast<int>(W)));
-        }
-        
-        return out;
-    }
-    
-    throw std::runtime_error("adaptive_avg_pool2d only supports output_size=1 currently");
-}
-
-// ============================================================================
 // Accuracy computation
 // ============================================================================
 
@@ -522,6 +447,35 @@ T compute_accuracy(const Tensor<T>& logits, const Tensor<T>& labels_one_hot) {
     }
     
     return static_cast<T>(correct) / static_cast<T>(N);
+}
+
+// ============================================================================
+// Signal handling for graceful checkpoint save on SIGINT/SIGTERM
+// ============================================================================
+
+volatile sig_atomic_t g_interrupted = 0;
+extern "C" void handle_signal(int) {
+    g_interrupted = 1;
+}
+
+const std::string CHECKPOINT_PATH = "resnet10_checkpoint.bin";
+const std::string CHECKPOINT_META_PATH = "resnet10_checkpoint_meta.bin";
+
+template<typename T>
+void save_checkpoint_meta(const std::string& path, int epoch, T best_val_acc) {
+    std::ofstream f(path, std::ios::binary);
+    if (!f) return;
+    f.write(reinterpret_cast<const char*>(&epoch), sizeof(epoch));
+    f.write(reinterpret_cast<const char*>(&best_val_acc), sizeof(T));
+}
+
+template<typename T>
+bool load_checkpoint_meta(const std::string& path, int& epoch, T& best_val_acc) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) return false;
+    f.read(reinterpret_cast<char*>(&epoch), sizeof(epoch));
+    f.read(reinterpret_cast<char*>(&best_val_acc), sizeof(T));
+    return f.good();
 }
 
 // ============================================================================
@@ -693,159 +647,91 @@ int main() {
     // Optimizer
     Adam<T> optimizer(model->parameters(), T(0.001), T(0.9), T(0.999), T(1e-8), T(0.0001));
     
-    // Training settings
+    GraphExecutor<T> executor(model, optimizer,
+        [](const Tensor<T>& pred, const Tensor<T>& target) {
+            return cross_entropy(pred, target);
+        });
+    
+    std::cout << "executor created\n";
+    
+    // Cosine annealing scheduler
+    CosineAnnealingLR<T> scheduler(optimizer, 30, T(1e-6));
+    
     const int epochs = 30;
     T best_val_acc = T(0);
     std::string best_weights_path = "best_resnet10.bin";
+    int start_epoch = 0;
     
-    // CUDA Graphs state
-    bool buffers_init = false;
-    Tensor<T> bx_gpu, by_gpu;
-    hipGraphExec_t graphExec = nullptr;
-    hipGraph_t graphHandle = nullptr;
-    bool use_graph = false;
-    bool capture_attempted = false;
-    int warmup_done = 0;
-    const int warmup_batches = 2;
-    Tensor<T> graph_loss_;
-    hipStream_t graph_stream = nullptr;
-    GPU_CHECK(hipStreamCreateWithFlags(&graph_stream, hipStreamNonBlocking));
+    // Resume from checkpoint if one exists
+    {
+        std::ifstream f(CHECKPOINT_PATH);
+        if (f.good()) {
+            f.close();
+            std::cout << "\nCheckpoint found! Loading for resumption..." << std::endl;
+            auto model_params = model->parameters();
+            size_t loaded_step;
+            T lr_tmp, b1, b2, eps_tmp, wd_tmp;
+            load_checkpoint_into<T>(CHECKPOINT_PATH,
+                                    model_params,
+                                    optimizer.m(),
+                                    optimizer.v(),
+                                    loaded_step,
+                                    lr_tmp, b1, b2, eps_tmp, wd_tmp,
+                                    &scheduler);
+            optimizer.set_step(loaded_step);
+            
+            int meta_epoch;
+            T meta_best;
+            if (load_checkpoint_meta(CHECKPOINT_META_PATH, meta_epoch, meta_best)) {
+                start_epoch = meta_epoch + 1;
+                if (meta_best > best_val_acc) best_val_acc = meta_best;
+                std::cout << "Resuming from epoch " << start_epoch + 1 << "/" << epochs
+                          << " (best val acc: " << (best_val_acc * 100) << "%)" << std::endl;
+            }
+        }
+    }
+    
+    // Install signal handlers
+    std::signal(SIGINT, handle_signal);
+    std::signal(SIGTERM, handle_signal);
+    
+    // Lambda for saving checkpoint (used both at epoch end and on interrupt)
+    auto save_checkpoint_now = [&](int current_epoch) {
+        auto ckpt_params = model->parameters();
+        const auto& const_opt = optimizer;
+        save_checkpoint<T>(CHECKPOINT_PATH,
+                          ckpt_params,
+                          const_opt.m(), const_opt.v(),
+                          const_opt.step(),
+                          const_opt.lr(), const_opt.beta1(), const_opt.beta2(),
+                          const_opt.eps(), const_opt.weight_decay(),
+                          &scheduler);
+        save_checkpoint_meta(CHECKPOINT_META_PATH, current_epoch, best_val_acc);
+    };
     
     std::cout << "\n[3] Training for " << epochs << " epochs..." << std::endl;
     std::cout << std::fixed << std::setprecision(4);
     
-    for (int epoch = 0; epoch < epochs; ++epoch) {
+    for (int epoch = start_epoch; epoch < epochs; ++epoch) {
         auto epoch_start = std::chrono::high_resolution_clock::now();
         
-        // Training phase
         model->train();
         T train_loss = 0;
         size_t train_batches = 0;
         
         for (auto [bx, by] : train_loader) {
-            size_t this_batch = train_batches + 1;
-            auto t_total = std::chrono::high_resolution_clock::now();
+            auto bx_gpu = bx.to(gpu);
+            auto by_gpu = by.to(gpu);
             
-            // ---- Init persistent GPU buffers (from first batch shape) ----
-            if (!buffers_init) {
-                bx_gpu = Tensor<T>(bx.shape(), Device{DeviceType::CUDA});
-                by_gpu = Tensor<T>(by.shape(), Device{DeviceType::CUDA});
-                buffers_init = true;
-            }
-            
-            // ---- Data transfer: CPU -> persistent GPU buffers ----
-            auto t_data_start = std::chrono::high_resolution_clock::now();
-            GPU_CHECK(hipMemcpy(bx_gpu.data(), bx.data(),
-                                bx.total_elements() * sizeof(T), hipMemcpyHostToDevice));
-            GPU_CHECK(hipMemcpy(by_gpu.data(), by.data(),
-                                by.total_elements() * sizeof(T), hipMemcpyHostToDevice));
-            auto t_data_done = std::chrono::high_resolution_clock::now();
-            
-            // Zero gradients always outside graph (hipMemset doesn't take a stream)
-            auto t_zg = std::chrono::high_resolution_clock::now();
-            optimizer.zero_grad();
-            (void)hipStreamSynchronize(nullptr);  // flush default stream before capture
-            auto t_zero_done = std::chrono::high_resolution_clock::now();
-            
-            if (use_graph) {
-                auto t_gpu_start = std::chrono::high_resolution_clock::now();
-                GPU_CHECK(hipGraphLaunch(graphExec, graph_stream));
-                auto t_gpu_done = std::chrono::high_resolution_clock::now();
-                
-                auto t_opt_start = std::chrono::high_resolution_clock::now();
-                (void)hipStreamSynchronize(graph_stream);
-                optimizer.step();
-                auto t_opt_done = std::chrono::high_resolution_clock::now();
-                
-                auto t_h2d_start = std::chrono::high_resolution_clock::now();
-                train_loss += graph_loss_.to({DeviceType::CPU}).data()[0];
-                auto t_h2d_done = std::chrono::high_resolution_clock::now();
-                
-                ++train_batches;
-                auto t_total_end = std::chrono::high_resolution_clock::now();
-                
-                using dbl_sec = std::chrono::duration<double>;
-                auto to_ms = [](auto d) { return std::chrono::duration_cast<std::chrono::milliseconds>(d).count(); };
-                
-                std::cout << std::format("batch {} ({}ms total) [GRAPH]: "
-                    "zero:{}ms data:{}ms gpu:{}ms opt:{}ms h2d:{}ms | avg_loss:{:.4f}\n",
-                    this_batch, to_ms(t_total_end - t_total),
-                    to_ms(t_zero_done - t_zg), to_ms(t_data_done - t_data_start),
-                    to_ms(t_gpu_done - t_gpu_start),
-                    to_ms(t_opt_done - t_opt_start), to_ms(t_h2d_done - t_h2d_start),
-                    train_loss / train_batches);
-            } else {
-                bool capturing = false;
-                if (warmup_done >= warmup_batches && !capture_attempted) {
-                    capture_attempted = true;
-                    active_stream() = graph_stream;
-                    capturing = (hipStreamBeginCapture(graph_stream, hipStreamCaptureModeRelaxed) == hipSuccess);
-                    if (!capturing) {
-                        std::cout << "  [HIP Graphs: capture unavailable, running normally]\n";
-                        active_stream() = nullptr;
-                    }
-                }
-                
-                auto t_fwd_start = std::chrono::high_resolution_clock::now();
-                auto pred = model->forward(bx_gpu);
-                auto t_fwd_done = std::chrono::high_resolution_clock::now();
-                
-                auto t_loss_start = std::chrono::high_resolution_clock::now();
-                auto loss = cross_entropy(pred, by_gpu);
-                auto t_loss_done = std::chrono::high_resolution_clock::now();
-                
-                auto t_bwd_start = std::chrono::high_resolution_clock::now();
-                loss.backward();
-                auto t_bwd_done = std::chrono::high_resolution_clock::now();
-                
-                // End capture BEFORE optimizer step (correct t_ evolution)
-                if (capturing) {
-                    hipGraph_t g;
-                    hipError_t cap_err = hipStreamEndCapture(graph_stream, &g);
-                    if (cap_err == hipSuccess) {
-                        hipError_t inst_err = hipGraphInstantiate(&graphExec, g, nullptr, nullptr, 0);
-                        if (inst_err == hipSuccess) {
-                            use_graph = true;
-                            graphHandle = g;
-                            graph_loss_ = loss;
-                            std::cout << "  [CUDA Graphs: capture OK, switching to graph replay]\n";
-                        } else {
-                            (void)hipGraphDestroy(g);
-                            active_stream() = nullptr;
-                        }
-                    }
-                    if (!use_graph) {
-                        std::cout << "  [CUDA Graphs: capture FAILED (err=" << cap_err
-                                  << "), running normally]\n";
-                        active_stream() = nullptr;
-                    }
-                    capturing = false;
-                }
-                
-                // Optimizer always outside capture for correct t_ evolution
-                auto t_opt_start = std::chrono::high_resolution_clock::now();
-                optimizer.step();
-                auto t_opt_done = std::chrono::high_resolution_clock::now();
-                
-                auto t_h2d_start = std::chrono::high_resolution_clock::now();
-                train_loss += loss.to({DeviceType::CPU}).data()[0];
-                auto t_h2d_done = std::chrono::high_resolution_clock::now();
-                
-                ++train_batches;
-                warmup_done++;
-                auto t_total_end = std::chrono::high_resolution_clock::now();
-                
-                using dbl_sec = std::chrono::duration<double>;
-                auto to_ms = [](auto d) { return std::chrono::duration_cast<std::chrono::milliseconds>(d).count(); };
-                
-                std::cout << std::format("batch {} ({}ms total): "
-                    "data:{}ms zero:{}ms fwd:{}ms loss:{}ms bwd:{}ms opt:{}ms h2d:{}ms | avg_loss:{:.4f}\n",
-                    this_batch, to_ms(t_total_end - t_total),
-                    to_ms(t_data_done - t_data_start), to_ms(t_zero_done - t_zg),
-                    to_ms(t_fwd_done - t_fwd_start), to_ms(t_loss_done - t_loss_start),
-                    to_ms(t_bwd_done - t_bwd_start), to_ms(t_opt_done - t_opt_start),
-                    to_ms(t_h2d_done - t_h2d_start),
-                    train_loss / train_batches);
+            auto loss = executor.step(bx_gpu, by_gpu);
+            train_loss += loss.to({DeviceType::CPU}).data()[0];
+            ++train_batches;
+
+            if (g_interrupted) {
+                save_checkpoint_now(epoch);
+                std::cout << "\nInterrupted during epoch " << epoch + 1
+                          << "! Checkpoint saved. Exiting." << std::endl;
+                return 0;
             }
         }
         
@@ -888,33 +774,40 @@ int main() {
         // Save best weights
         if (avg_val_acc > best_val_acc) {
             best_val_acc = avg_val_acc;
-            save_state_dict(best_weights_path, model->parameters());
+            model->save(best_weights_path);
             std::cout << " [BEST]";
         }
         std::cout << std::endl;
+        
+        // Save checkpoint for training resumption
+        save_checkpoint_now(epoch);
+        
+        // Step scheduler (decays LR for next epoch)
+        scheduler.step();
+        
+        // Graceful shutdown on SIGINT/SIGTERM (catch interrupts during validation)
+        if (g_interrupted) {
+            std::cout << "\nInterrupted! Checkpoint saved. Exiting." << std::endl;
+            return 0;
+        }
     }
     
     // Load best weights
     std::cout << "\n[4] Loading best weights..." << std::endl;
-    auto final_params = model->parameters();
-    load_state_dict_into(best_weights_path, final_params);
+    model->load(best_weights_path);
     std::cout << "Best validation accuracy: " << (best_val_acc * 100) << "%" << std::endl;
     
     // Save final model
     std::cout << "\n[5] Saving model..." << std::endl;
-    save_state_dict("resnet10_final.bin", model->parameters());
+    model->save("resnet10_final.bin");
     std::cout << "Saved final weights to resnet10_final.bin" << std::endl;
     
     // Export graph structure
-    GraphExport<T>::save_graph("resnet10.graph", *model);
+    model->export_onnx("resnet10.graph");
     std::cout << "Saved graph structure to resnet10.graph" << std::endl;
     
     // Export ONNX (simplified format)
     export_onnx("resnet10.onnx.txt", *model, {1, 3, 84, 84});
-    
-    if (graphExec) (void)hipGraphExecDestroy(graphExec);
-    if (graphHandle) (void)hipGraphDestroy(graphHandle);
-    if (graph_stream) (void)hipStreamDestroy(graph_stream);
     
     std::cout << "\n=== Training Complete ===" << std::endl;
     
