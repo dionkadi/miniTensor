@@ -54,7 +54,9 @@ public:
                 return ptr;
             }
             void* ptr = nullptr;
-#if defined(USE_CUDA) || defined(USE_ROCM)
+#if defined(USE_CUDA)
+            GPU_CHECK(cudaHostAlloc(&ptr, bytes, cudaHostAllocDefault));
+#elif defined(USE_ROCM)
             GPU_CHECK(hipHostMalloc(&ptr, bytes));
 #else
             ptr = std::malloc(bytes);
@@ -100,7 +102,9 @@ public:
         std::lock_guard<std::mutex> lock(mtx_);
         for (auto& pair : cpu_pool_) {
             for (void* ptr : pair.second) {
-#if defined(USE_CUDA) || defined(USE_ROCM)
+#if defined(USE_CUDA)
+                (void)cudaFreeHost(ptr);
+#elif defined(USE_ROCM)
                 (void)hipHostFree(ptr);
 #else
                 std::free(ptr);
