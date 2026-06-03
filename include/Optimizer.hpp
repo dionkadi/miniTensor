@@ -14,6 +14,8 @@ public:
     virtual ~Optimizer() = default;
 
     virtual void step() = 0;
+    virtual T lr() const = 0;
+    virtual void set_lr(T lr) = 0;
 
     std::vector<Tensor<T>>& get_parameters() { return parameters_; }
     const std::vector<Tensor<T>>& get_parameters() const { return parameters_; }
@@ -34,6 +36,9 @@ private:
 public:
     SGD(const std::vector<Tensor<T>>& params, T lr, T weight_decay = (T)0.0) 
         : Optimizer<T>(params), lr_(lr), weight_decay_(weight_decay) {}
+
+    T lr() const override { return lr_; }
+    void set_lr(T lr) override { lr_ = lr; }
 
     void step() override {
         NoGradGuard guard; 
@@ -83,6 +88,21 @@ public:
             v_.push_back(v);
         }
     }
+
+    T lr() const override { return lr_; }
+    void set_lr(T lr) override { lr_ = lr; }
+
+    // Checkpoint state accessors for training resumption
+    const std::vector<Tensor<T>>& m() const { return m_; }
+    const std::vector<Tensor<T>>& v() const { return v_; }
+    std::vector<Tensor<T>>& m() { return m_; }
+    std::vector<Tensor<T>>& v() { return v_; }
+    size_t step() const { return t_; }
+    void set_step(size_t t) { t_ = t; }
+    T beta1() const { return beta1_; }
+    T beta2() const { return beta2_; }
+    T eps() const { return eps_; }
+    T weight_decay() const { return weight_decay_; }
 
     void step() override {
         NoGradGuard guard;
