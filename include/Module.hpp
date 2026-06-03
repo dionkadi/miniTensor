@@ -27,6 +27,10 @@ public:
     Tensor<T> operator()(const Tensor<T>& x) {
         return forward(x);
     }
+
+    void save(const std::string& path) const;
+    void load(const std::string& path);
+    void export_onnx(const std::string& path);
 };
 
 template<typename T>
@@ -440,3 +444,47 @@ public:
 
     std::vector<Tensor<T>> parameters() const override { return {}; }
 };
+
+template<typename T>
+class AdaptiveAvgPool2D : public Module<T> {
+public:
+    const char* name() const override { return "AdaptiveAvgPool2D"; }
+
+    size_t output_size_;
+
+    AdaptiveAvgPool2D(size_t output_size = 1) : output_size_(output_size) {}
+
+    Tensor<T> forward(const Tensor<T>& x) override {
+        auto shape = x.shape();
+        if (shape.size() < 2)
+            throw std::invalid_argument("AdaptiveAvgPool2D: input must have >= 2 dims");
+        size_t H = shape[shape.size() - 2], W = shape[shape.size() - 1];
+        if (output_size_ == 1) {
+            auto pooled = sum(x, shape.size() - 2, true);
+            pooled = sum(pooled, shape.size() - 1, true);
+            return pooled * (T(1) / T(H * W));
+        }
+        throw std::runtime_error("AdaptiveAvgPool2D: only output_size=1 supported");
+    }
+
+    std::vector<Tensor<T>> parameters() const override { return {}; }
+};
+
+#include "Serialization.hpp"
+#include "GraphExport.hpp"
+
+template<typename T>
+void Module<T>::save(const std::string& path) const {
+    save_state_dict(path, parameters());
+}
+
+template<typename T>
+void Module<T>::load(const std::string& path) {
+    auto params = parameters();
+    load_state_dict_into(path, params);
+}
+
+template<typename T>
+void Module<T>::export_onnx(const std::string& path) {
+    GraphExport<T>::save_graph(path, *this);
+}
