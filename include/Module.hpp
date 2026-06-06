@@ -95,7 +95,8 @@ public:
         bias_.set_requires_grad(true);
 
         // Initialization
-        std::mt19937 gen(42);
+        static std::mt19937::result_type linear_seed = 1000000;
+        std::mt19937 gen(linear_seed++);
         std::normal_distribution<T> dist(0.0, std::sqrt(2.0 / in_features));
         
         T* w_data = weight_.data();
@@ -221,7 +222,8 @@ public:
 
         T fan_in = static_cast<T>(in_channels * kernel_size * kernel_size);
         T std = std::sqrt(T(2.0) / fan_in);
-        std::mt19937 gen(42);
+        static std::mt19937::result_type init_seed = 42;
+        std::mt19937 gen(init_seed++);
         std::normal_distribution<T> dist(0.0, std);
         T* w = weight_.data();
         for (size_t i = 0; i < weight_.total_elements(); ++i) {
