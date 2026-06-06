@@ -37,6 +37,8 @@ inline cudaError_t get_last_error_capture_safe() {
 
 using GpuStream_t = cudaStream_t;
 using GpuEvent_t  = cudaEvent_t;
+using GpuGraph_t     = cudaGraph_t;
+using GpuGraphExec_t = cudaGraphExec_t;
 
 #elif defined(USE_ROCM)
 
@@ -71,11 +73,15 @@ inline hipError_t get_last_error_capture_safe() {
 }
 using GpuStream_t = hipStream_t;
 using GpuEvent_t  = hipEvent_t;
+using GpuGraph_t     = hipGraph_t;
+using GpuGraphExec_t = hipGraphExec_t;
 
 #else
     #define GPU_CHECK(call)
     using GpuStream_t = void*;
     using GpuEvent_t  = void*;
+    using GpuGraph_t     = void*;
+    using GpuGraphExec_t = void*;
 #endif
 
 class GpuStream {
