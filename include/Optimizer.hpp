@@ -19,6 +19,16 @@ public:
 
     std::vector<Tensor<T>>& get_parameters() { return parameters_; }
     const std::vector<Tensor<T>>& get_parameters() const { return parameters_; }
+    
+    // Checkpoint accessors for optimizer state serialization.
+    // Subclasses override to expose their internal state buffers
+    // (e.g. momentum velocity, Adam m/v) and scalar hyperparameters.
+    virtual std::vector<Tensor<T>> state_buffers() const { return {}; }
+    virtual void set_state_buffers(const std::vector<Tensor<T>>&) {}
+    virtual std::vector<T> state_scalars() const { return {}; }
+    virtual void set_state_scalars(const std::vector<T>&) {}
+    virtual size_t current_step() const { return 0; }
+    virtual void set_step(size_t) {}
 
     void zero_grad() {
         for (auto& p : parameters_) {
@@ -32,18 +42,60 @@ class SGD : public Optimizer<T> {
 private:
     T lr_;
     T weight_decay_;
+    T momentum_;
+    size_t t_ = 0;
+
+    std::vector<Tensor<T>> velocity_;
 
 public:
-    SGD(const std::vector<Tensor<T>>& params, T lr, T weight_decay = (T)0.0) 
-        : Optimizer<T>(params), lr_(lr), weight_decay_(weight_decay) {}
+    SGD(const std::vector<Tensor<T>>& params, T lr, T weight_decay = (T)0.0, T momentum = (T)0.0) 
+        : Optimizer<T>(params), lr_(lr), weight_decay_(weight_decay)     
+    {
+        set_momentum(momentum);
+    }
 
     T lr() const override { return lr_; }
     void set_lr(T lr) override { lr_ = lr; }
 
+    void set_momentum(T momentum) {
+        momentum_ = momentum;
+        if (momentum_ > T(0) && velocity_.empty()) {
+            for (const auto& p : this->parameters_) {
+                Tensor<T> v(p.shape(), p.device());
+                v.fill(T(0));
+                velocity_.push_back(v);
+            }
+        }
+    }
+
+    const std::vector<Tensor<T>>& velocity() const { return velocity_; }
+    std::vector<Tensor<T>>& velocity() { return velocity_; }
+    T weight_decay() const { return weight_decay_; }
+    T momentum() const { return momentum_; }
+
+    std::vector<Tensor<T>> state_buffers() const override { return velocity_; }
+    void set_state_buffers(const std::vector<Tensor<T>>& bufs) override {
+        for (size_t i = 0; i < velocity_.size() && i < bufs.size(); ++i)
+            velocity_[i] = bufs[i];
+    }
+    std::vector<T> state_scalars() const override {
+        return {lr_, weight_decay_, momentum_};
+    }
+    void set_state_scalars(const std::vector<T>& s) override {
+        lr_ = s[0];
+        weight_decay_ = s[1];
+        momentum_ = s[2];
+    }
+    size_t current_step() const override { return t_; }
+    void set_step(size_t t) override { t_ = t; }
+
+
     void step() override {
+        ++t_;
         NoGradGuard guard; 
 
-        for (auto& p : this->parameters_) {
+        for (size_t i = 0; i < this->parameters_.size(); ++i) {
+            auto& p = this->parameters_[i];
             if (p.grad().empty()) continue;
             
             Tensor<T> current_grad = p.grad();
@@ -52,8 +104,19 @@ public:
                 current_grad = current_grad + (p * weight_decay_);
             }
 
-            Tensor<T> step = current_grad * lr_;
-            sub_(p, step); 
+            if (momentum_ > T(0)) {
+                if (velocity_.size() <= i) {
+                    Tensor<T> v(p.shape(), p.device());
+                    v.fill(T(0));
+                    velocity_.push_back(v);
+                }
+                velocity_[i] = velocity_[i] * momentum_ + current_grad;
+                Tensor<T> step = velocity_[i] * lr_;
+                sub_(p, step);
+            } else {
+                Tensor<T> step = current_grad * lr_;
+                sub_(p, step);
+            }
         }
     }
 };
@@ -97,12 +160,37 @@ public:
     const std::vector<Tensor<T>>& v() const { return v_; }
     std::vector<Tensor<T>>& m() { return m_; }
     std::vector<Tensor<T>>& v() { return v_; }
-    size_t step() const { return t_; }
-    void set_step(size_t t) { t_ = t; }
     T beta1() const { return beta1_; }
     T beta2() const { return beta2_; }
     T eps() const { return eps_; }
     T weight_decay() const { return weight_decay_; }
+    std::vector<Tensor<T>> state_buffers() const override {
+        std::vector<Tensor<T>> r;
+        r.reserve(m_.size() + v_.size());
+        r.insert(r.end(), m_.begin(), m_.end());
+        r.insert(r.end(), v_.begin(), v_.end());
+        return r;
+    }
+    void set_state_buffers(const std::vector<Tensor<T>>& bufs) override {
+        size_t n = m_.size();
+        for (size_t i = 0; i < n && i < bufs.size(); ++i)
+            m_[i] = bufs[i];
+        for (size_t i = 0; i < n && n + i < bufs.size(); ++i)
+            v_[i] = bufs[n + i];
+    }
+    std::vector<T> state_scalars() const override {
+        return {lr_, beta1_, beta2_, eps_, weight_decay_};
+    }
+    void set_state_scalars(const std::vector<T>& s) override {
+        lr_ = s[0];
+        beta1_ = s[1];
+        beta2_ = s[2];
+        eps_ = s[3];
+        weight_decay_ = s[4];
+    }
+    size_t current_step() const override { return t_; }
+    void set_step(size_t t) override { t_ = t; }
+
 
     void step() override {
         NoGradGuard guard;
@@ -137,6 +225,110 @@ public:
             Tensor<T> v_hat = v_[i] * ((T)1.0 / bias_correction2);
             Tensor<T> denom = sqrt(v_hat) + eps_;
             Tensor<T> step_size = (m_hat / denom) * lr_;
+            sub_(p, step_size);
+        }
+    }
+};
+
+template<typename T>
+class AdamW : public Optimizer<T> {
+private:
+    T lr_;
+    T beta1_;
+    T beta2_;
+    T eps_;
+    T weight_decay_;
+    size_t t_;
+
+    // State buffers for 1st and 2nd moments
+    std::vector<Tensor<T>> m_;
+    std::vector<Tensor<T>> v_;
+
+public:
+    AdamW(const std::vector<Tensor<T>>& params, T lr = 0.001, T beta1 = 0.9, T beta2 = 0.999, T eps = 1e-8, T weight_decay = (T)0.01) 
+        : Optimizer<T>(params), lr_(lr), beta1_(beta1), beta2_(beta2), eps_(eps), weight_decay_(weight_decay), t_(0)
+    {
+        // Initialize moment buffers to zero
+        for (const auto& p : this->parameters_) {
+            Tensor<T> m(p.shape(), p.device());
+            m.fill((T)0.0);
+            m_.push_back(m);
+            Tensor<T> v(p.shape(), p.device());
+            v.fill((T)0.0);
+            v_.push_back(v);
+        }
+    }
+
+    T lr() const override { return lr_; }
+    void set_lr(T lr) override { lr_ = lr; }
+
+    // Checkpoint / state accessors
+    const std::vector<Tensor<T>>& m() const { return m_; }
+    const std::vector<Tensor<T>>& v() const { return v_; }
+    std::vector<Tensor<T>>& m() { return m_; }
+    std::vector<Tensor<T>>& v() { return v_; }
+    T beta1() const { return beta1_; }
+    T beta2() const { return beta2_; }
+    T eps() const { return eps_; }
+
+    std::vector<Tensor<T>> state_buffers() const override {
+        std::vector<Tensor<T>> r;
+        r.reserve(m_.size() + v_.size());
+        r.insert(r.end(), m_.begin(), m_.end());
+        r.insert(r.end(), v_.begin(), v_.end());
+        return r;
+    }
+    void set_state_buffers(const std::vector<Tensor<T>>& bufs) override {
+        size_t n = m_.size();
+        for (size_t i = 0; i < n && i < bufs.size(); ++i)
+            m_[i] = bufs[i];
+        for (size_t i = 0; i < n && n + i < bufs.size(); ++i)
+            v_[i] = bufs[n + i];
+    }
+    std::vector<T> state_scalars() const override {
+        return {lr_, beta1_, beta2_, eps_, weight_decay_};
+    }
+    void set_state_scalars(const std::vector<T>& s) override {
+        lr_ = s[0];
+        beta1_ = s[1];
+        beta2_ = s[2];
+        eps_ = s[3];
+        weight_decay_ = s[4];
+    }
+    size_t current_step() const override { return t_; }
+    void set_step(size_t t) override { t_ = t; }
+
+    void step() override {
+        NoGradGuard guard;
+        t_++;
+
+        T bias_correction1 = (T)1.0 - std::pow(beta1_, (T)t_);
+        T bias_correction2 = (T)1.0 - std::pow(beta2_, (T)t_);
+
+        for (size_t i = 0; i < this->parameters_.size(); ++i) {
+            auto& p = this->parameters_[i];
+            if (p.grad().empty()) continue;
+
+            auto& g = p.grad();
+
+            if (p.device().type == DeviceType::CUDA) {
+#if defined(USE_CUDA) || defined(USE_ROCM)
+                adamw_step_gpu(p, g, m_[i], v_[i],
+                               lr_, beta1_, beta2_, eps_,
+                               bias_correction1, bias_correction2, weight_decay_);
+                continue;
+#endif
+            }
+
+            // CPU fallback: decoupled weight decay
+            Tensor<T> grad = g;   // pure gradient
+            m_[i] = (m_[i] * beta1_) + (grad * ((T)1.0 - beta1_));
+            v_[i] = (v_[i] * beta2_) + (pow2(grad) * ((T)1.0 - beta2_));
+            Tensor<T> m_hat = m_[i] * ((T)1.0 / bias_correction1);
+            Tensor<T> v_hat = v_[i] * ((T)1.0 / bias_correction2);
+            Tensor<T> denom = sqrt(v_hat) + eps_;
+            // Adam update + decoupled weight decay as separate term
+            Tensor<T> step_size = (m_hat / denom) * lr_ + p * lr_ * weight_decay_;
             sub_(p, step_size);
         }
     }

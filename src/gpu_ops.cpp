@@ -652,6 +652,164 @@ __global__ void batched_sgemm_kernel(
     }
 }
 
+// ============================================================
+// V2 Batched GEMM: 1024 threads, coalesced A-load, BK=16, TM=TN=4
+// A [M, K] shared, B [B, K, N_mat], C [B, M, N_mat]
+// 3D grid: (N_mat/BN, M/BM, B) with block(32,32)
+// ============================================================
+template <const int BM = 128, const int BN = 128, const int BK = 16,
+          const int TM = 4, const int TN = 4>
+__global__ void batched_sgemm_kernel_v2(
+    const float* __restrict__ a, const float* __restrict__ b, float* __restrict__ c,
+    const int M, const int N, const int K,
+    const int batch_stride_b, const int batch_stride_c,
+    const float* bias, const int bias_N
+) {
+    int bx = blockIdx.x, by = blockIdx.y, batch = blockIdx.z;
+    int tx = threadIdx.x, ty = threadIdx.y;
+    int tid = ty * 32 + tx;
+
+    __shared__ float s_a[2][BK][BM];
+    __shared__ float s_b[2][BK][BN + 1];
+
+    float r_c[TM][TN] = {0.0f};
+
+    // A-load: 8 threads/row, each loads 2 floats (coalesced)
+    int a_row = tid >> 3;           // 0..127 (BM)
+    int a_ck  = (tid & 7) << 1;     // 0,2,4,...,14 (within BK=16)
+
+    // B-load: 64 threads/k-row, each loads 2 floats
+    int b_k = tid >> 6;             // 0..15 (BK)
+    int b_n = (tid & 63) << 1;      // 0,2,...,126 (within BN=128)
+
+    int g_row = by * BM + a_row;   // global row in M dimension
+    int g_n   = bx * BN + b_n;     // global column in N dimension
+
+    const float* b_batch = b + static_cast<size_t>(batch) * batch_stride_b;
+    float* c_batch = c + static_cast<size_t>(batch) * batch_stride_c;
+
+    // Preload first tile
+    float r_a[2], r_b[2];
+    {
+        int g_ak = a_ck;
+        if (g_row < M && g_ak < K) {
+            if (g_ak + 1 < K)
+                cast<float2>(&r_a[0]) = cast<float2>(&a[static_cast<size_t>(g_row) * K + g_ak]);
+            else {
+                r_a[0] = a[static_cast<size_t>(g_row) * K + g_ak]; r_a[1] = 0.0f;
+            }
+        } else {
+            r_a[0] = 0.0f; r_a[1] = 0.0f;
+        }
+        int g_bk_val = b_k;
+        if (g_bk_val < K && g_n < N) {
+            if (g_n + 1 < N)
+                cast<float2>(&r_b[0]) = cast<float2>(&b_batch[static_cast<size_t>(g_bk_val) * N + g_n]);
+            else {
+                r_b[0] = b_batch[static_cast<size_t>(g_bk_val) * N + g_n]; r_b[1] = 0.0f;
+            }
+        } else {
+            r_b[0] = 0.0f; r_b[1] = 0.0f;
+        }
+    }
+    s_a[0][a_ck + 0][a_row] = r_a[0];
+    s_a[0][a_ck + 1][a_row] = r_a[1];
+    s_b[0][b_k][b_n + 0] = r_b[0];
+    s_b[0][b_k][b_n + 1] = r_b[1];
+    __syncthreads();
+
+    int num_tiles = (K + BK - 1) / BK;
+    for (int tile = 1; tile < num_tiles; ++tile) {
+        int prev = (tile - 1) & 1;
+        int next = tile & 1;
+
+        // Load next A tile
+        {
+            int g_ak = tile * BK + a_ck;
+            if (g_row < M && g_ak < K) {
+                if (g_ak + 1 < K)
+                    cast<float2>(&r_a[0]) = cast<float2>(&a[static_cast<size_t>(g_row) * K + g_ak]);
+                else {
+                    r_a[0] = a[static_cast<size_t>(g_row) * K + g_ak]; r_a[1] = 0.0f;
+                }
+            } else {
+                r_a[0] = 0.0f; r_a[1] = 0.0f;
+            }
+        }
+        // Load next B tile
+        {
+            int g_bk_val = tile * BK + b_k;
+            if (g_bk_val < K && g_n < N) {
+                if (g_n + 1 < N)
+                    cast<float2>(&r_b[0]) = cast<float2>(&b_batch[static_cast<size_t>(g_bk_val) * N + g_n]);
+                else {
+                    r_b[0] = b_batch[static_cast<size_t>(g_bk_val) * N + g_n]; r_b[1] = 0.0f;
+                }
+            } else {
+                r_b[0] = 0.0f; r_b[1] = 0.0f;
+            }
+        }
+
+        // Compute on previous tile
+        #pragma unroll
+        for (int k = 0; k < BK; ++k) {
+            float r_comp_a[TM];
+            float r_comp_b[TN];
+            #pragma unroll
+            for (int tm = 0; tm < TM; ++tm)
+                r_comp_a[tm] = s_a[prev][k][ty * TM + tm];
+            #pragma unroll
+            for (int tn = 0; tn < TN; ++tn)
+                r_comp_b[tn] = s_b[prev][k][tx * TN + tn];
+            #pragma unroll
+            for (int tm = 0; tm < TM; ++tm)
+                #pragma unroll
+                for (int tn = 0; tn < TN; ++tn)
+                    r_c[tm][tn] = __fmaf_rn(r_comp_a[tm], r_comp_b[tn], r_c[tm][tn]);
+        }
+
+        // Store next tile
+        s_a[next][a_ck + 0][a_row] = r_a[0];
+        s_a[next][a_ck + 1][a_row] = r_a[1];
+        s_b[next][b_k][b_n + 0] = r_b[0];
+        s_b[next][b_k][b_n + 1] = r_b[1];
+        __syncthreads();
+    }
+
+    // Final tile
+    int last = (num_tiles - 1) & 1;
+    #pragma unroll
+    for (int k = 0; k < BK; ++k) {
+        float r_comp_a[TM];
+        float r_comp_b[TN];
+        #pragma unroll
+        for (int tm = 0; tm < TM; ++tm)
+            r_comp_a[tm] = s_a[last][k][ty * TM + tm];
+        #pragma unroll
+        for (int tn = 0; tn < TN; ++tn)
+            r_comp_b[tn] = s_b[last][k][tx * TN + tn];
+        #pragma unroll
+        for (int tm = 0; tm < TM; ++tm)
+            #pragma unroll
+            for (int tn = 0; tn < TN; ++tn)
+                r_c[tm][tn] = __fmaf_rn(r_comp_a[tm], r_comp_b[tn], r_c[tm][tn]);
+    }
+
+    // Write results with optional bias
+    #pragma unroll
+    for (int tm = 0; tm < TM; ++tm) {
+        int row = by * BM + ty * TM + tm;
+        if (row >= M) continue;
+        float bias_val = bias ? bias[row] : 0.0f;
+        #pragma unroll
+        for (int tn = 0; tn < TN; ++tn) {
+            int col = bx * BN + tx * TN + tn;
+            if (col >= N) continue;
+            c_batch[static_cast<size_t>(row) * N + col] = r_c[tm][tn] + bias_val;
+        }
+    }
+}
+
 // Fused backward: batched_sgemm (W^T x dL/dY) -> col2im in one pass
 // Eliminates the d_grad_col intermediate write+read traffic.
 // Each thread handles one (n, c_in, h, w) pixel in grad_input.
@@ -721,25 +879,230 @@ __global__ void matmul_kernel_strided(
     }
 }
 
+// ============================================================
+// V2 GEMM: 1024 threads, coalesced A-load, BK=16, TM=TN=4
+// ============================================================
+template<int BM, int BN, int BK, int TM, int TN>
+__global__ void sgemm_kernel_v2(
+    const float* __restrict__ A, const float* __restrict__ B, float* __restrict__ C,
+    int M, int N, int K
+) {
+    int bx = blockIdx.x, by = blockIdx.y;
+    int tx = threadIdx.x, ty = threadIdx.y;  // 32×32 = 1024 threads
+    int tid = ty * 32 + tx;
+
+    // Shared memory: s_a[k][m] transposed for stride-1 k-read; s_b padded to avoid bank conflicts
+    __shared__ float s_a[2][BK][BM];
+    __shared__ float s_b[2][BK][BN + 1];
+
+    float r_c[TM][TN] = {0.0f};
+
+    // ---- A-load: 8 threads/row, each loads 2 floats (coalesced within warp) ----
+    int a_row = tid >> 3;           // tid/8 = 0..127 (BM)
+    int a_ck  = (tid & 7) << 1;     // 0,2,4,...,14 (column within BK=16)
+
+    // ---- B-load: 64 threads/k-row, each loads 2 floats ----
+    int b_k = tid >> 6;             // tid/64 = 0..15 (BK rows)
+    int b_n = (tid & 63) << 1;      // 0,2,...,126 (BN=128 columns)
+
+    int g_row = by * BM + a_row;   // global row in M dimension
+    int g_bn  = bx * BN + b_n;     // global column in N dimension
+
+    // Preload first tile
+    float r_a[2], r_b[2];
+    {
+        int g_ak = a_ck;  // K index for this A tile
+        if (g_row < M && g_ak < K) {
+            if (g_ak + 1 < K) {
+                cast<float2>(&r_a[0]) = cast<float2>(&A[static_cast<size_t>(g_row) * K + g_ak]);
+            } else {
+                r_a[0] = A[static_cast<size_t>(g_row) * K + g_ak]; r_a[1] = 0.0f;
+            }
+        } else {
+            r_a[0] = 0.0f; r_a[1] = 0.0f;
+        }
+        int g_bk_val = b_k;  // K index for this B tile
+        if (g_bk_val < K && g_bn < N) {
+            if (g_bn + 1 < N) {
+                cast<float2>(&r_b[0]) = cast<float2>(&B[static_cast<size_t>(g_bk_val) * N + g_bn]);
+            } else {
+                r_b[0] = B[static_cast<size_t>(g_bk_val) * N + g_bn]; r_b[1] = 0.0f;
+            }
+        } else {
+            r_b[0] = 0.0f; r_b[1] = 0.0f;
+        }
+    }
+    // Store transposed: s_a[k][a_row] for stride-1 k-read during compute
+    s_a[0][a_ck + 0][a_row] = r_a[0];
+    s_a[0][a_ck + 1][a_row] = r_a[1];
+    s_b[0][b_k][b_n + 0] = r_b[0];
+    s_b[0][b_k][b_n + 1] = r_b[1];
+    __syncthreads();
+
+    int num_tiles = (K + BK - 1) / BK;
+    for (int tile = 1; tile < num_tiles; ++tile) {
+        int prev = (tile - 1) & 1;
+        int next = tile & 1;
+
+        // Load next A tile
+        {
+            int g_ak = tile * BK + a_ck;
+            if (g_row < M && g_ak < K) {
+                if (g_ak + 1 < K)
+                    cast<float2>(&r_a[0]) = cast<float2>(&A[static_cast<size_t>(g_row) * K + g_ak]);
+                else {
+                    r_a[0] = A[static_cast<size_t>(g_row) * K + g_ak]; r_a[1] = 0.0f;
+                }
+            } else {
+                r_a[0] = 0.0f; r_a[1] = 0.0f;
+            }
+        }
+        // Load next B tile
+        {
+            int g_bk_val = tile * BK + b_k;
+            if (g_bk_val < K && g_bn < N) {
+                if (g_bn + 1 < N)
+                    cast<float2>(&r_b[0]) = cast<float2>(&B[static_cast<size_t>(g_bk_val) * N + g_bn]);
+                else {
+                    r_b[0] = B[static_cast<size_t>(g_bk_val) * N + g_bn]; r_b[1] = 0.0f;
+                }
+            } else {
+                r_b[0] = 0.0f; r_b[1] = 0.0f;
+            }
+        }
+
+        // Compute on previous tile
+        #pragma unroll
+        for (int k = 0; k < BK; ++k) {
+            float r_comp_a[TM];
+            float r_comp_b[TN];
+            #pragma unroll
+            for (int tm = 0; tm < TM; ++tm)
+                r_comp_a[tm] = s_a[prev][k][ty * TM + tm];
+            #pragma unroll
+            for (int tn = 0; tn < TN; ++tn)
+                r_comp_b[tn] = s_b[prev][k][tx * TN + tn];
+            #pragma unroll
+            for (int tm = 0; tm < TM; ++tm)
+                #pragma unroll
+                for (int tn = 0; tn < TN; ++tn)
+                    r_c[tm][tn] = __fmaf_rn(r_comp_a[tm], r_comp_b[tn], r_c[tm][tn]);
+        }
+
+        // Store next tile
+        s_a[next][a_ck + 0][a_row] = r_a[0];
+        s_a[next][a_ck + 1][a_row] = r_a[1];
+        s_b[next][b_k][b_n + 0] = r_b[0];
+        s_b[next][b_k][b_n + 1] = r_b[1];
+        __syncthreads();
+    }
+
+    // Final tile
+    int last = (num_tiles - 1) & 1;
+    #pragma unroll
+    for (int k = 0; k < BK; ++k) {
+        float r_comp_a[TM];
+        float r_comp_b[TN];
+        #pragma unroll
+        for (int tm = 0; tm < TM; ++tm)
+            r_comp_a[tm] = s_a[last][k][ty * TM + tm];
+        #pragma unroll
+        for (int tn = 0; tn < TN; ++tn)
+            r_comp_b[tn] = s_b[last][k][tx * TN + tn];
+        #pragma unroll
+        for (int tm = 0; tm < TM; ++tm)
+            #pragma unroll
+            for (int tn = 0; tn < TN; ++tn)
+                r_c[tm][tn] = __fmaf_rn(r_comp_a[tm], r_comp_b[tn], r_c[tm][tn]);
+    }
+
+    // Write results
+    #pragma unroll
+    for (int tm = 0; tm < TM; ++tm) {
+        int row = by * BM + ty * TM + tm;
+        if (row >= M) continue;
+        #pragma unroll
+        for (int tn = 0; tn < TN; ++tn) {
+            int col = bx * BN + tx * TN + tn;
+            if (col >= N) continue;
+            C[row * N + col] = r_c[tm][tn];
+        }
+    }
+}
+
 template<typename T>
 void matmul_gpu(const Tensor<T>& A, const Tensor<T>& B, Tensor<T>& C) {
     size_t M = A.shape()[0];
     size_t K = A.shape()[1];
     size_t N = B.shape()[1];
 
-    constexpr int BM = 128, BN = 128, BK = 8;
-    constexpr int TM = 8, TN = 8;
-    dim3 threads(16, 16);
-    dim3 blocks((N + BN - 1) / BN, (M + BM - 1) / BM);
-    sgemm_kernel<BM, BN, BK, TM, TN, 1><<<blocks, threads, 0, active_stream()>>>(
-        A.data(), B.data(), C.data(), M, N, K
-    );
+    // Use v2 GEMM for most sizes; fall back to strided for tiny M×N where
+    // v2's 128×128 tile overhead doesn't pay off.
+    if (M < 64 && N < 64) {
+        matmul_gpu_strided(A, B, C);
+        return;
+    }
 
-#if defined(USE_CUDA)
-    GPU_CHECK(get_last_error_capture_safe());
-#elif defined(USE_ROCM)
+    if constexpr (std::is_same_v<T, float>) {
+        constexpr int BM = 128, BN = 128, BK = 16;
+        constexpr int TM = 4, TN = 4;
+        int blocks_x = ((int)N + BN - 1) / BN;
+        int blocks_y = ((int)M + BM - 1) / BM;
+        if (blocks_x > 0 && blocks_y > 0) {
+            dim3 threads(32, 32);
+            dim3 blocks(blocks_x, blocks_y);
+            sgemm_kernel_v2<BM, BN, BK, TM, TN><<<blocks, threads, 0, active_stream()>>>(
+                reinterpret_cast<const float*>(A.data()),
+                reinterpret_cast<const float*>(B.data()),
+                reinterpret_cast<float*>(C.data()),
+                (int)M, (int)N, (int)K
+            );
+        }
+    } else {
+        constexpr int BM = 128, BN = 128, BK = 8;
+        constexpr int TM = 8, TN = 8;
+        dim3 threads(16, 16);
+        dim3 blocks((N + BN - 1) / BN, (M + BM - 1) / BM);
+        sgemm_kernel<BM, BN, BK, TM, TN, 1><<<blocks, threads, 0, active_stream()>>>(
+            A.data(), B.data(), C.data(), M, N, K
+        );
+    }
+
+#if defined(USE_CUDA) || defined(USE_ROCM)
     GPU_CHECK(get_last_error_capture_safe());
 #endif
+}
+
+// V2 matmul host wrapper for benchmark comparisons
+template<typename T>
+void matmul_gpu_v2(const Tensor<T>& A, const Tensor<T>& B, Tensor<T>& C) {
+    size_t M = A.shape()[0];
+    size_t K = A.shape()[1];
+    size_t N = B.shape()[1];
+
+    constexpr int BM = 128, BN = 128, BK = 16;
+    constexpr int TM = 4, TN = 4;
+    int blocks_x = ((int)N + BN - 1) / BN;
+    int blocks_y = ((int)M + BM - 1) / BM;
+    if (blocks_x == 0 || blocks_y == 0) return;
+
+    dim3 threads(32, 32);
+    dim3 blocks(blocks_x, blocks_y);
+    sgemm_kernel_v2<BM, BN, BK, TM, TN><<<blocks, threads, 0, active_stream()>>>(
+        reinterpret_cast<const float*>(A.data()),
+        reinterpret_cast<const float*>(B.data()),
+        reinterpret_cast<float*>(C.data()),
+        (int)M, (int)N, (int)K
+    );
+
+    GPU_CHECK(get_last_error_capture_safe());
+}
+
+// BK=16 non-v2 variant for benchmark comparison (same design as old kernel but BK=16)
+template<typename T>
+void matmul_gpu_bk16(const Tensor<T>& A, const Tensor<T>& B, Tensor<T>& C) {
+    // Reuse v2 since the old kernel can't support BK=16 with its loading pattern
+    matmul_gpu_v2(A, B, C);
 }
 
 template<typename T>
@@ -1235,6 +1598,64 @@ __global__ void col2im_kernel(
     data_im[((n * C + c) * H + h) * W + w] = val;
 }
 
+// Backward-weight im2col: writes X as K × M row-major contiguous (K = N*H_out*W_out, M = C_in*kH*kW)
+// Single element per thread, coalesced writes along M dimension.
+// Grid: dim3(ceil(K/16), ceil(M/16)), Block: dim3(16, 16) with tx→M, ty→K for coalesced write
+template<typename T>
+__global__ void im2col_bwd_weight_kernel(
+    const T* __restrict__ data_im,
+    T* __restrict__ data_col,
+    int N, int C, int H, int W,
+    int kH, int kW, int pad, int stride,
+    int H_out, int W_out
+) {
+    int k = blockIdx.x * blockDim.y + threadIdx.y;  // spatial index across all batches
+    int m = blockIdx.y * blockDim.x + threadIdx.x;  // channel*kernel index
+    int K = N * H_out * W_out;
+    int M = C * kH * kW;
+
+    if (k >= K || m >= M) return;
+
+    int n = k / (H_out * W_out);
+    int s = k % (H_out * W_out);
+    int h_out = s / W_out;
+    int w_out = s % W_out;
+
+    int c_in = m / (kH * kW);
+    int khw = m % (kH * kW);
+    int kh = khw / kW;
+    int kw = khw % kW;
+
+    int h_in = h_out * stride + kh - pad;
+    int w_in = w_out * stride + kw - pad;
+
+    T val = T(0);
+    if (h_in >= 0 && h_in < H && w_in >= 0 && w_in < W) {
+        val = data_im[((n * C + c_in) * H + h_in) * W + w_in];
+    }
+    data_col[k * M + m] = val;
+}
+
+// Transpose dY from (N, C_out, H_out, W_out) layout to C_out × K contiguous
+// where K = N * H_out * W_out. Used by backward weight.
+// Grid: dim3(ceil(K/16), ceil(C_out/16)), Block: dim3(16, 16)
+template<typename T>
+__global__ void dy_transpose_bwd_kernel(
+    const T* __restrict__ dY,     // N × C_out × N_mat
+    T* __restrict__ dYT,          // C_out × K (K = N * N_mat)
+    int N, int C_out, int N_mat
+) {
+    int k = blockIdx.x * blockDim.x + threadIdx.x;  // = n * N_mat + s
+    int co = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (k >= N * N_mat || co >= C_out) return;
+
+    int n = k / N_mat;
+    int s = k % N_mat;
+
+    dYT[co * (N * N_mat) + k] = dY[(n * C_out + co) * N_mat + s];
+}
+
 // #######################################################
 // #   Winograd F(2x2, 3x3) GPU Kernels
 // #   F(2x2, 3x3): input tile 4x4, filter 3x3, output 2x2
@@ -1571,9 +1992,9 @@ void conv2d_gpu(
     // Tiled batched GEMM: all N batch items in one 3D launch
     // weight [M, K] (shared), col [N, K, N_mat], output [N, M, N_mat]
     if constexpr (std::is_same_v<T, float>) {
-        dim3 batched_threads(16, 16);
+        dim3 batched_threads(32, 32);
         dim3 batched_blocks((N_mat + 127) / 128, (M + 127) / 128, N);
-        batched_sgemm_kernel<128, 128, 8, 8, 8><<<batched_blocks, batched_threads, 0, active_stream()>>>(
+        batched_sgemm_kernel_v2<128, 128, 16, 4, 4><<<batched_blocks, batched_threads, 0, active_stream()>>>(
             reinterpret_cast<const float*>(weight.data()),
             reinterpret_cast<const float*>(d_data_col),
             reinterpret_cast<float*>(output.data()),
@@ -1899,15 +2320,90 @@ void conv2d_backward_weight_gpu(const Tensor<T>& grad_output, const Tensor<T>& i
     size_t C_out = grad_weight.shape()[0], kH = grad_weight.shape()[2], kW = grad_weight.shape()[3];
     size_t H_out = grad_output.shape()[2], W_out = grad_output.shape()[3];
 
-    int threads = 256;
-    size_t smem_bytes = threads * sizeof(T);
-    dim3 blocks((uint32_t)C_out, (uint32_t)C_in, (uint32_t)(kH * kW));
+    size_t K = N * H_out * W_out;
+    size_t M = C_in * kH * kW;
 
-    conv2d_bwd_weight_direct_kernel<<<blocks, threads, smem_bytes, active_stream()>>>(
-        grad_output.data(), input.data(), grad_weight.data(),
-        (int)N, (int)C_in, (int)H, (int)W, (int)C_out, (int)kH, (int)kW,
-        (int)H_out, (int)W_out, (int)stride, (int)padding);
+    if (K == 0 || M == 0 || C_out == 0) return;
+
+    // For tiny M (C_in*kH*kW), im2col overhead + sparse GEMM doesn't beat the
+    // direct kernel which reads X+dY with tree reduction.
+    if (M < 128) {
+        int threads = 256;
+        size_t smem_bytes = threads * sizeof(T);
+        dim3 blocks((uint32_t)C_out, (uint32_t)C_in, (uint32_t)(kH * kW));
+        conv2d_bwd_weight_direct_kernel<<<blocks, threads, smem_bytes, active_stream()>>>(
+            grad_output.data(), input.data(), grad_weight.data(),
+            (int)N, (int)C_in, (int)H, (int)W, (int)C_out, (int)kH, (int)kW,
+            (int)H_out, (int)W_out, (int)stride, (int)padding);
+        GPU_CHECK(get_last_error_capture_safe());
+        return;
+    }
+
+    // Temporary buffers: X_col (K × M) + dY_T (C_out × K)
+    size_t col_size = K * M * sizeof(float);
+    size_t dyt_size = C_out * K * sizeof(float);
+
+    T* X_col = static_cast<T*>(MemoryPool::get().allocate(col_size, Device{DeviceType::CUDA}));
+    T* dY_T  = static_cast<T*>(MemoryPool::get().allocate(dyt_size, Device{DeviceType::CUDA}));
+
+    // 1. im2col: input → X_col (K × M contiguous)
+    {
+        dim3 threads(16, 16);
+        dim3 blocks((K + 15) / 16, (M + 15) / 16);
+        if (blocks.x > 0 && blocks.y > 0) {
+            im2col_bwd_weight_kernel<T><<<blocks, threads, 0, active_stream()>>>(
+                input.data(), X_col, (int)N, (int)C_in, (int)H, (int)W,
+                (int)kH, (int)kW, (int)padding, (int)stride, (int)H_out, (int)W_out
+            );
+        }
+    }
+
+    // 2. Transpose dY: (N, C_out, H_out, W_out) → C_out × K
+    {
+        dim3 threads(16, 16);
+        dim3 blocks((K + 15) / 16, (C_out + 15) / 16);
+        if (blocks.x > 0 && blocks.y > 0) {
+            dy_transpose_bwd_kernel<T><<<blocks, threads, 0, active_stream()>>>(
+                grad_output.data(), dY_T, (int)N, (int)C_out, (int)(H_out * W_out)
+            );
+        }
+    }
+
+    // 3. matmul: dY_T (C_out × K) @ X_col (K × M) → dW (C_out × M)
+    // Use v2 for adequate grid sizes; fall back to strided for tiny M×C_out
+    {
+        int v2_blocks_x = ((int)M + 127) / 128;
+        int v2_blocks_y = ((int)C_out + 127) / 128;
+        if (v2_blocks_x * v2_blocks_y >= 4) {
+            constexpr int BM = 128, BN = 128, BK = 16;
+            constexpr int TM = 4, TN = 4;
+            dim3 mm_threads(32, 32);
+            dim3 mm_blocks(v2_blocks_x, v2_blocks_y);
+            sgemm_kernel_v2<BM, BN, BK, TM, TN><<<mm_blocks, mm_threads, 0, active_stream()>>>(
+                reinterpret_cast<const float*>(dY_T),
+                reinterpret_cast<const float*>(X_col),
+                reinterpret_cast<float*>(grad_weight.data()),
+                (int)C_out, (int)M, (int)K
+            );
+        } else {
+            dim3 threads(16, 16);
+            dim3 blocks(((int)M + 15) / 16, ((int)C_out + 15) / 16);
+            if (blocks.x > 0 && blocks.y > 0) {
+                matmul_kernel_strided<T><<<blocks, threads, 0, active_stream()>>>(
+                    dY_T, X_col, grad_weight.data(),
+                    C_out, K, M,
+                    K, 1,   // stride_a: C_out×K row-major
+                    M, 1,   // stride_b: K×M row-major
+                    M, 1,   // stride_c: C_out×M row-major
+                    0, 0, 0
+                );
+            }
+        }
+    }
+
     GPU_CHECK(get_last_error_capture_safe());
+    MemoryPool::get().free(X_col, col_size, Device{DeviceType::CUDA});
+    MemoryPool::get().free(dY_T, dyt_size, Device{DeviceType::CUDA});
 }
 
 template<typename T> 
@@ -1917,7 +2413,7 @@ void conv2d_backward_bias_gpu(const Tensor<T>& grad_output, Tensor<T>& grad_bias
     size_t total_bias = grad_bias.total_elements();
 
     int threads = 256;
-    int blocks = (total_out + threads - 1) / threads;
+    int blocks = ((int)C_out + threads - 1) / threads;
 
 #if defined(USE_CUDA)
     GPU_CHECK(active_stream() ? cudaMemsetAsync(grad_bias.data(), 0, total_bias * sizeof(T), active_stream()) : cudaMemset(grad_bias.data(), 0, total_bias * sizeof(T)));
@@ -2306,22 +2802,50 @@ __global__ void cross_entropy_bwd_kernel(
     T* grad_logits,
     int B, int C
 ) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total = B * C;
-    if (idx >= total) return;
-
-    int bid = idx / C;
-    int cid = idx % C;
+    int bid = blockIdx.x;
+    if (bid >= B) return;
 
     const T* l = logits + bid * C;
+    const T* t = targets + bid * C;
+    T* gl = grad_logits + bid * C;
 
-    T max_val = l[0];
-    for (int i = 1; i < C; ++i) max_val = fmax(max_val, l[i]);
+    extern __shared__ __align__(sizeof(T)) unsigned char smem[];
+    T* shared = reinterpret_cast<T*>(smem);
+
+    // 1. Parallel max reduction over the row
+    T max_val = T(-1e30);
+    for (int i = threadIdx.x; i < C; i += blockDim.x)
+        max_val = fmax(max_val, l[i]);
+    shared[threadIdx.x] = max_val;
+    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
+        __syncthreads();
+        if (threadIdx.x < s)
+            shared[threadIdx.x] = fmax(shared[threadIdx.x], shared[threadIdx.x + s]);
+    }
+    __syncthreads();
+    T batch_max = shared[0];
+    __syncthreads();
+
+    // 2. Parallel sum(exp) reduction over the row
     T sum_exp = 0;
-    for (int i = 0; i < C; ++i) sum_exp += exp(l[i] - max_val);
-    T p = exp(l[cid] - max_val) / sum_exp;
+    for (int i = threadIdx.x; i < C; i += blockDim.x)
+        sum_exp += exp(l[i] - batch_max);
+    shared[threadIdx.x] = sum_exp;
+    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
+        __syncthreads();
+        if (threadIdx.x < s)
+            shared[threadIdx.x] += shared[threadIdx.x + s];
+    }
+    __syncthreads();
+    T total_exp = shared[0];
+    __syncthreads();
 
-    grad_logits[idx] = (p - targets[idx]) * grad_output[0] / T(B);
+    // 3. Compute gradients for the elements owned by this thread
+    T go_scale = grad_output[0] / T(B);
+    for (int i = threadIdx.x; i < C; i += blockDim.x) {
+        T p = exp(l[i] - batch_max) / total_exp;
+        gl[i] = (p - t[i]) * go_scale;
+    }
 }
 
 template<typename T>
@@ -2376,13 +2900,17 @@ void cross_entropy_bwd_gpu(
 ) {
     int B = logits.shape()[0];
     int C = logits.shape()[1];
-    int total = B * C;
 
-    int threads = 256;
-    int blocks = (total + threads - 1) / threads;
-    if (blocks == 0) return;
+    if (B == 0) return;
 
-    cross_entropy_bwd_kernel<T><<<blocks, threads, 0, active_stream()>>>(
+    // One block per row, threads cooperate via SMEM (same pattern as fwd kernel)
+    int threads = min(C, 256);
+    int pow2 = 1;
+    while (pow2 < threads) pow2 <<= 1;
+    threads = min(pow2, 256);
+    size_t smem = (threads + 1) * sizeof(T);
+
+    cross_entropy_bwd_kernel<T><<<B, threads, smem, active_stream()>>>(
         logits.data(), targets.data(), grad_output.data(),
         grad_logits.data(), B, C
     );
@@ -2621,6 +3149,132 @@ void adam_step_gpu(
 }
 
 // #######################################################
+// #   AdamW (decoupled weight decay) — GPU kernels
+// #######################################################
+
+template<typename T>
+__global__ void adamw_step_vec_kernel(
+    T* param, const T* grad, T* m, T* v,
+    size_t N,
+    T lr, T beta1, T beta2, T eps,
+    T bias_correction1, T bias_correction2,
+    T weight_decay
+) {
+    size_t vec_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t idx = vec_idx * 4;
+    if (idx >= N) return;
+
+    float4 g_vec = reinterpret_cast<const float4*>(grad)[vec_idx];
+    float4 p_vec = reinterpret_cast<const float4*>(param)[vec_idx];
+    float4 m_vec = reinterpret_cast<const float4*>(m)[vec_idx];
+    float4 v_vec = reinterpret_cast<const float4*>(v)[vec_idx];
+
+    // Pure gradient — NO weight decay mixed in
+    float4 m_out, v_out;
+    m_out.x = fma(beta1, m_vec.x, (T(1.0) - beta1) * g_vec.x);
+    v_out.x = fma(beta2, v_vec.x, (T(1.0) - beta2) * g_vec.x * g_vec.x);
+    m_out.y = fma(beta1, m_vec.y, (T(1.0) - beta1) * g_vec.y);
+    v_out.y = fma(beta2, v_vec.y, (T(1.0) - beta2) * g_vec.y * g_vec.y);
+    m_out.z = fma(beta1, m_vec.z, (T(1.0) - beta1) * g_vec.z);
+    v_out.z = fma(beta2, v_vec.z, (T(1.0) - beta2) * g_vec.z * g_vec.z);
+    m_out.w = fma(beta1, m_vec.w, (T(1.0) - beta1) * g_vec.w);
+    v_out.w = fma(beta2, v_vec.w, (T(1.0) - beta2) * g_vec.w * g_vec.w);
+
+    reinterpret_cast<float4*>(m)[vec_idx] = m_out;
+    reinterpret_cast<float4*>(v)[vec_idx] = v_out;
+
+    float inv_bc1 = T(1.0) / bias_correction1;
+    float inv_bc2 = T(1.0) / bias_correction2;
+
+    // Decoupled weight decay: applies AFTER the Adam update
+    float4 p_out;
+    p_out.x = p_vec.x - lr * (m_out.x * inv_bc1) / (sqrt(v_out.x * inv_bc2) + eps)
+                       - lr * weight_decay * p_vec.x;
+    p_out.y = p_vec.y - lr * (m_out.y * inv_bc1) / (sqrt(v_out.y * inv_bc2) + eps)
+                       - lr * weight_decay * p_vec.y;
+    p_out.z = p_vec.z - lr * (m_out.z * inv_bc1) / (sqrt(v_out.z * inv_bc2) + eps)
+                       - lr * weight_decay * p_vec.z;
+    p_out.w = p_vec.w - lr * (m_out.w * inv_bc1) / (sqrt(v_out.w * inv_bc2) + eps)
+                       - lr * weight_decay * p_vec.w;
+
+    reinterpret_cast<float4*>(param)[vec_idx] = p_out;
+}
+
+template<typename T>
+__global__ void adamw_step_kernel(
+    T* param, const T* grad, T* m, T* v,
+    size_t N,
+    T lr, T beta1, T beta2, T eps,
+    T bias_correction1, T bias_correction2,
+    T weight_decay
+) {
+    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= N) return;
+
+    T g = grad[idx];   // pure gradient — NO weight decay
+
+    T m_new = beta1 * m[idx] + (T(1.0) - beta1) * g;
+    T v_new = beta2 * v[idx] + (T(1.0) - beta2) * g * g;
+
+    m[idx] = m_new;
+    v[idx] = v_new;
+
+    T m_hat = m_new / bias_correction1;
+    T v_hat = v_new / bias_correction2;
+
+    // Decoupled weight decay applied as separate term
+    param[idx] -= lr * (m_hat / (sqrt(v_hat) + eps) + weight_decay * param[idx]);
+}
+
+template<typename T>
+void adamw_step_gpu(
+    Tensor<T>& param, const Tensor<T>& grad, Tensor<T>& m, Tensor<T>& v,
+    T lr, T beta1, T beta2, T eps,
+    T bias_correction1, T bias_correction2, T weight_decay
+) {
+    size_t N = param.total_elements();
+    int threads = 256;
+
+    if constexpr (sizeof(T) == 4) {
+        size_t vec_n = N / 4;
+        if (vec_n > 0) {
+            int vec_blocks = (vec_n + threads - 1) / threads;
+            adamw_step_vec_kernel<T><<<vec_blocks, threads, 0, active_stream()>>>(
+                param.data(), grad.data(), m.data(), v.data(),
+                N, lr, beta1, beta2, eps,
+                bias_correction1, bias_correction2, weight_decay
+            );
+        }
+        size_t rem = N % 4;
+        if (rem > 0) {
+            size_t offset = N - rem;
+            int rem_blocks = (rem + threads - 1) / threads;
+            if (rem_blocks == 0) rem_blocks = 1;
+            adamw_step_kernel<T><<<rem_blocks, threads, 0, active_stream()>>>(
+                param.data() + offset, grad.data() + offset,
+                m.data() + offset, v.data() + offset,
+                rem, lr, beta1, beta2, eps,
+                bias_correction1, bias_correction2, weight_decay
+            );
+        }
+    } else {
+        int blocks = (N + threads - 1) / threads;
+        if (blocks == 0) return;
+        adamw_step_kernel<T><<<blocks, threads, 0, active_stream()>>>(
+            param.data(), grad.data(), m.data(), v.data(),
+            N, lr, beta1, beta2, eps,
+            bias_correction1, bias_correction2, weight_decay
+        );
+    }
+
+#if defined(USE_CUDA)
+    GPU_CHECK(get_last_error_capture_safe());
+#elif defined(USE_ROCM)
+    GPU_CHECK(get_last_error_capture_safe());
+#endif
+}
+
+// #######################################################
 // #   Explicit Instantiations
 // #######################################################
 template void binary_gpu<float, AddOp<float>>(const Tensor<float>&, const Tensor<float>&, Tensor<float>&, AddOp<float>);
@@ -2656,6 +3310,8 @@ template void unary_gpu_strided<float, SqrtOp<float>>(Tensor<float> const&, Tens
 
 template void matmul_gpu<float>(const Tensor<float>&, const Tensor<float>&, Tensor<float>&);
 template void matmul_gpu_strided<float>(const Tensor<float>&, const Tensor<float>&, Tensor<float>&);
+template void matmul_gpu_v2<float>(const Tensor<float>&, const Tensor<float>&, Tensor<float>&);
+template void matmul_gpu_bk16<float>(const Tensor<float>&, const Tensor<float>&, Tensor<float>&);
 template Tensor<float> sum_gpu<float>(const Tensor<float>&, size_t, bool);
 template void add_relu_gpu<float>(const Tensor<float>&, const Tensor<float>&, Tensor<float>&);
 template void bn_fwd_gpu<float>(const Tensor<float>&, Tensor<float>&, Tensor<float>&);
@@ -2674,4 +3330,5 @@ template void copy_gpu_strided<float>(const Tensor<float> src, float* dst);
 template Tensor<float> cross_entropy_fwd_gpu<float>(const Tensor<float>&, const Tensor<float>&);
 template void cross_entropy_bwd_gpu<float>(const Tensor<float>&, const Tensor<float>&, const Tensor<float>&, Tensor<float>&);
 template void adam_step_gpu<float>(Tensor<float>&, const Tensor<float>&, Tensor<float>&, Tensor<float>&, float, float, float, float, float, float, float);
+template void adamw_step_gpu<float>(Tensor<float>&, const Tensor<float>&, Tensor<float>&, Tensor<float>&, float, float, float, float, float, float, float);
 template Tensor<float> softmax_gpu<float>(const Tensor<float>&);

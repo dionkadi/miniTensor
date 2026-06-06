@@ -96,17 +96,23 @@ void load_state_dict_into(const std::string& path, std::vector<Tensor<T>>& targe
 }
 
 // ---------------------------------------------------------------------------
-// Checkpoint save/load — model params + optimizer state for training resumption
+// Generic Checkpoint — model params + optimizer state + scheduler
 // ---------------------------------------------------------------------------
-
-template<typename T>
-struct Checkpoint {
-    std::vector<Tensor<T>> params;
-    std::vector<Tensor<T>> m_buffers;   // Adam first moments
-    std::vector<Tensor<T>> v_buffers;   // Adam second moments
-    size_t step = 0;
-    T lr{}, beta1{}, beta2{}, eps{}, weight_decay{};
-};
+// Binary format (all little-endian):
+//   [uint32_t magic      = 0x4D544E53]   "MTNS"
+//   [uint32_t num_params]
+//   [num_params × tensor]                 model parameters
+//   [uint32_t num_opt_buffers]
+//   [num_opt_buffers × tensor]            optimizer state buffers (flattened;
+//                                          e.g. 1 velocity for SGD+momentum,
+//                                          2 m+v for Adam/AdamW)
+//   [uint64_t step]
+//   [uint32_t num_opt_scalars]
+//   [num_opt_scalars × T]                 scalars (e.g. lr, wd, momentum
+//                                          or lr, beta1, beta2, eps, wd)
+//   [uint8_t  has_scheduler]
+//   [if has_scheduler]                    scheduler save_state()
+// ---------------------------------------------------------------------------
 
 namespace {
 
@@ -167,190 +173,84 @@ void copy_into_maybe_gpu(const Tensor<T>& src, Tensor<T>& dst) {
 template<typename T>
 void save_checkpoint(const std::string& path,
                      const std::vector<Tensor<T>>& params,
-                     const std::vector<Tensor<T>>& m_buffers,
-                     const std::vector<Tensor<T>>& v_buffers,
+                     const std::vector<Tensor<T>>& opt_buffers,
                      size_t step,
-                     T lr, T beta1, T beta2, T eps, T weight_decay) {
+                     const std::vector<T>& opt_scalars,
+                     const LRScheduler<T>* scheduler = nullptr) {
     std::ofstream f(path, std::ios::binary);
     if (!f) throw std::runtime_error("Cannot open " + path + " for writing");
 
-    uint32_t num_params = static_cast<uint32_t>(params.size());
-    f.write(reinterpret_cast<const char*>(&num_params), sizeof(num_params));
-
-    // Model parameters
-    for (const auto& p : params)
-        write_tensor(f, p);
-
-    // Adam m buffers
-    for (const auto& m : m_buffers)
-        write_tensor(f, m);
-
-    // Adam v buffers
-    for (const auto& v : v_buffers)
-        write_tensor(f, v);
-
-    // Optimizer hyperparams
-    uint64_t step64 = static_cast<uint64_t>(step);
-    f.write(reinterpret_cast<const char*>(&step64), sizeof(step64));
-    f.write(reinterpret_cast<const char*>(&lr), sizeof(T));
-    f.write(reinterpret_cast<const char*>(&beta1), sizeof(T));
-    f.write(reinterpret_cast<const char*>(&beta2), sizeof(T));
-    f.write(reinterpret_cast<const char*>(&eps), sizeof(T));
-    f.write(reinterpret_cast<const char*>(&weight_decay), sizeof(T));
-}
-
-template<typename T>
-Checkpoint<T> load_checkpoint(const std::string& path) {
-    std::ifstream f(path, std::ios::binary);
-    if (!f) throw std::runtime_error("Cannot open " + path + " for reading");
-
-    uint32_t num_params;
-    f.read(reinterpret_cast<char*>(&num_params), sizeof(num_params));
-
-    Checkpoint<T> ckpt;
-
-    // Model parameters
-    for (uint32_t i = 0; i < num_params; ++i)
-        ckpt.params.push_back(read_tensor<T>(f));
-
-    // Adam m buffers
-    for (uint32_t i = 0; i < num_params; ++i)
-        ckpt.m_buffers.push_back(read_tensor<T>(f));
-
-    // Adam v buffers
-    for (uint32_t i = 0; i < num_params; ++i)
-        ckpt.v_buffers.push_back(read_tensor<T>(f));
-
-    // Optimizer hyperparams
-    uint64_t step64;
-    f.read(reinterpret_cast<char*>(&step64), sizeof(step64));
-    ckpt.step = static_cast<size_t>(step64);
-    f.read(reinterpret_cast<char*>(&ckpt.lr), sizeof(T));
-    f.read(reinterpret_cast<char*>(&ckpt.beta1), sizeof(T));
-    f.read(reinterpret_cast<char*>(&ckpt.beta2), sizeof(T));
-    f.read(reinterpret_cast<char*>(&ckpt.eps), sizeof(T));
-    f.read(reinterpret_cast<char*>(&ckpt.weight_decay), sizeof(T));
-
-    return ckpt;
-}
-
-template<typename T>
-void load_checkpoint_into(const std::string& path,
-                          std::vector<Tensor<T>>& target_params,
-                          std::vector<Tensor<T>>& target_m,
-                          std::vector<Tensor<T>>& target_v,
-                          size_t& step,
-                          T& lr, T& beta1, T& beta2, T& eps, T& weight_decay) {
-    auto ckpt = load_checkpoint<T>(path);
-
-    if (ckpt.params.size() != target_params.size())
-        throw std::runtime_error("Parameter count mismatch in checkpoint");
-
-    for (size_t i = 0; i < ckpt.params.size(); ++i) {
-        copy_into_maybe_gpu(ckpt.params[i], target_params[i]);
-        copy_into_maybe_gpu(ckpt.m_buffers[i], target_m[i]);
-        copy_into_maybe_gpu(ckpt.v_buffers[i], target_v[i]);
-    }
-
-    step = ckpt.step;
-    lr = ckpt.lr;
-    beta1 = ckpt.beta1;
-    beta2 = ckpt.beta2;
-    eps = ckpt.eps;
-    weight_decay = ckpt.weight_decay;
-}
-
-// ---------------------------------------------------------------------------
-// Checkpoint save/load with optional scheduler state
-// ---------------------------------------------------------------------------
-// Format extension: after the standard checkpoint data, a uint8_t marker
-// (1 = scheduler present) followed by scheduler save_state(). Old checkpoints
-// without scheduler data are handled gracefully on load.
-// ---------------------------------------------------------------------------
-
-template<typename T>
-void save_checkpoint(const std::string& path,
-                     const std::vector<Tensor<T>>& params,
-                     const std::vector<Tensor<T>>& m_buffers,
-                     const std::vector<Tensor<T>>& v_buffers,
-                     size_t step,
-                     T lr, T beta1, T beta2, T eps, T weight_decay,
-                     const LRScheduler<T>* scheduler) {
-    std::ofstream f(path, std::ios::binary);
-    if (!f) throw std::runtime_error("Cannot open " + path + " for writing");
+    uint32_t magic = 0x4D544E53;  // "MTNS"
+    f.write(reinterpret_cast<const char*>(&magic), sizeof(magic));
 
     uint32_t num_params = static_cast<uint32_t>(params.size());
     f.write(reinterpret_cast<const char*>(&num_params), sizeof(num_params));
-
     for (const auto& p : params) write_tensor(f, p);
-    for (const auto& m : m_buffers) write_tensor(f, m);
-    for (const auto& v : v_buffers) write_tensor(f, v);
+
+    uint32_t num_opt_buffers = static_cast<uint32_t>(opt_buffers.size());
+    f.write(reinterpret_cast<const char*>(&num_opt_buffers), sizeof(num_opt_buffers));
+    for (const auto& buf : opt_buffers) write_tensor(f, buf);
 
     uint64_t step64 = static_cast<uint64_t>(step);
     f.write(reinterpret_cast<const char*>(&step64), sizeof(step64));
-    f.write(reinterpret_cast<const char*>(&lr), sizeof(T));
-    f.write(reinterpret_cast<const char*>(&beta1), sizeof(T));
-    f.write(reinterpret_cast<const char*>(&beta2), sizeof(T));
-    f.write(reinterpret_cast<const char*>(&eps), sizeof(T));
-    f.write(reinterpret_cast<const char*>(&weight_decay), sizeof(T));
 
-    // Optional scheduler state appended to file
-    if (scheduler) {
-        uint8_t has_sched = 1;
-        f.write(reinterpret_cast<const char*>(&has_sched), sizeof(has_sched));
+    uint32_t num_scalars = static_cast<uint32_t>(opt_scalars.size());
+    f.write(reinterpret_cast<const char*>(&num_scalars), sizeof(num_scalars));
+    for (auto s : opt_scalars)
+        f.write(reinterpret_cast<const char*>(&s), sizeof(T));
+
+    uint8_t has_sched = scheduler ? 1 : 0;
+    f.write(reinterpret_cast<const char*>(&has_sched), sizeof(has_sched));
+    if (scheduler)
         scheduler->save_state(f);
-    }
 }
 
 template<typename T>
 void load_checkpoint_into(const std::string& path,
                           std::vector<Tensor<T>>& target_params,
-                          std::vector<Tensor<T>>& target_m,
-                          std::vector<Tensor<T>>& target_v,
+                          std::vector<Tensor<T>>& target_opt_buffers,
                           size_t& step,
-                          T& lr, T& beta1, T& beta2, T& eps, T& weight_decay,
-                          LRScheduler<T>* scheduler) {
+                          std::vector<T>& opt_scalars,
+                          LRScheduler<T>* scheduler = nullptr) {
     std::ifstream f(path, std::ios::binary);
     if (!f) throw std::runtime_error("Cannot open " + path + " for reading");
 
+    uint32_t magic;
+    f.read(reinterpret_cast<char*>(&magic), sizeof(magic));
+    if (magic != 0x4D544E53)
+        throw std::runtime_error("Invalid checkpoint file (bad magic)");
+
     uint32_t num_params;
     f.read(reinterpret_cast<char*>(&num_params), sizeof(num_params));
+    if (num_params != target_params.size())
+        throw std::runtime_error("Parameter count mismatch in checkpoint");
+    for (uint32_t i = 0; i < num_params; ++i) {
+        auto t = read_tensor<T>(f);
+        copy_into_maybe_gpu(t, target_params[i]);
+    }
 
-    auto read_vec = [&]() {
-        std::vector<Tensor<T>> v;
-        for (uint32_t i = 0; i < num_params; ++i)
-            v.push_back(read_tensor<T>(f));
-        return v;
-    };
-
-    auto loaded_params = read_vec();
-    auto loaded_m = read_vec();
-    auto loaded_v = read_vec();
+    uint32_t num_opt_buffers;
+    f.read(reinterpret_cast<char*>(&num_opt_buffers), sizeof(num_opt_buffers));
+    if (num_opt_buffers != target_opt_buffers.size())
+        throw std::runtime_error("Opt buffer count mismatch in checkpoint");
+    for (uint32_t i = 0; i < num_opt_buffers; ++i) {
+        auto t = read_tensor<T>(f);
+        copy_into_maybe_gpu(t, target_opt_buffers[i]);
+    }
 
     uint64_t step64;
     f.read(reinterpret_cast<char*>(&step64), sizeof(step64));
     step = static_cast<size_t>(step64);
-    f.read(reinterpret_cast<char*>(&lr), sizeof(T));
-    f.read(reinterpret_cast<char*>(&beta1), sizeof(T));
-    f.read(reinterpret_cast<char*>(&beta2), sizeof(T));
-    f.read(reinterpret_cast<char*>(&eps), sizeof(T));
-    f.read(reinterpret_cast<char*>(&weight_decay), sizeof(T));
 
-    if (loaded_params.size() != target_params.size())
-        throw std::runtime_error("Parameter count mismatch in checkpoint");
+    uint32_t num_scalars;
+    f.read(reinterpret_cast<char*>(&num_scalars), sizeof(num_scalars));
+    if (num_scalars != opt_scalars.size())
+        throw std::runtime_error("Opt scalar count mismatch in checkpoint");
+    for (uint32_t i = 0; i < num_scalars; ++i)
+        f.read(reinterpret_cast<char*>(&opt_scalars[i]), sizeof(T));
 
-    for (size_t i = 0; i < loaded_params.size(); ++i) {
-        copy_into_maybe_gpu(loaded_params[i], target_params[i]);
-        copy_into_maybe_gpu(loaded_m[i], target_m[i]);
-        copy_into_maybe_gpu(loaded_v[i], target_v[i]);
-    }
-
-    // Optional scheduler state (backward compatible: old checkpoints without it)
-    if (scheduler) {
-        uint8_t has_sched;
-        f.read(reinterpret_cast<char*>(&has_sched), sizeof(has_sched));
-        if (f.good() && has_sched == 1) {
-            scheduler->load_state(f);
-        }
-    }
+    uint8_t has_sched;
+    f.read(reinterpret_cast<char*>(&has_sched), sizeof(has_sched));
+    if (f.good() && has_sched == 1 && scheduler)
+        scheduler->load_state(f);
 }

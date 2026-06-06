@@ -694,6 +694,8 @@ template<typename T, typename Op> void unary_gpu_strided(const Tensor<T>& A, Ten
 
 template<typename T> void matmul_gpu(const Tensor<T>& A, const Tensor<T>& B, Tensor<T>& C);
 template<typename T> void matmul_gpu_strided(const Tensor<T>& A, const Tensor<T>& B, Tensor<T>& C);
+template<typename T> void matmul_gpu_v2(const Tensor<T>& A, const Tensor<T>& B, Tensor<T>& C);
+template<typename T> void matmul_gpu_bk16(const Tensor<T>& A, const Tensor<T>& B, Tensor<T>& C);
 template<typename T> Tensor<T> sum_gpu(const Tensor<T>& input, size_t axis, bool keepdims);
 template<typename T> void conv2d_gpu(const Tensor<T>& input, const Tensor<T>& weight, const Tensor<T>& bias, Tensor<T>& output, size_t stride, size_t padding);
 template<typename T> void conv2d_gpu_strided(const Tensor<T>& input, const Tensor<T>& weight, const Tensor<T>& bias, Tensor<T>& output, size_t stride, size_t padding);
@@ -708,6 +710,7 @@ template<typename T> void copy_gpu_strided(const Tensor<T> src, T* dst);
 template<typename T> Tensor<T> cross_entropy_fwd_gpu(const Tensor<T>&, const Tensor<T>&);
 template<typename T> void cross_entropy_bwd_gpu(const Tensor<T>&, const Tensor<T>&, const Tensor<T>&, Tensor<T>&);
 template<typename T> void adam_step_gpu(Tensor<T>& param, const Tensor<T>& grad, Tensor<T>& m, Tensor<T>& v, T lr, T beta1, T beta2, T eps, T bias_correction1, T bias_correction2, T weight_decay);
+template<typename T> void adamw_step_gpu(Tensor<T>& param, const Tensor<T>& grad, Tensor<T>& m, Tensor<T>& v, T lr, T beta1, T beta2, T eps, T bias_correction1, T bias_correction2, T weight_decay);
 template<typename T> Tensor<T> softmax_gpu(const Tensor<T>& input);
 template<typename T> void add_relu_gpu(const Tensor<T>& A, const Tensor<T>& B, Tensor<T>& C);
 template<typename T> void bn_fwd_gpu(const Tensor<T>& input, Tensor<T>& mean, Tensor<T>& var);

@@ -124,6 +124,7 @@ private:
     GpuStream_t        capture_stream_ = nullptr;
 
     Tensor<T> eager_step(const Tensor<T>& x, const Tensor<T>& y) {
+        std::cout << "Eager...\n";
         model_->train();
         optimizer_.zero_grad();
         Tensor<T> preds = model_->forward(x);
@@ -134,6 +135,7 @@ private:
     }
 
     void capture_graph() {
+        std::cout << "Capture...\n";
 #if defined(USE_CUDA)
         (void)cudaDeviceSynchronize();
         GPU_CHECK(cudaStreamBeginCapture(
@@ -170,6 +172,7 @@ private:
     }
 
     Tensor<T> replay(const Tensor<T>& x, const Tensor<T>& y) {
+        // std::cout << "Replay...\n";
 #if defined(USE_CUDA)
         GPU_CHECK(cudaMemcpyAsync(static_x_.data(), x.data(),
                         x.total_elements() * sizeof(T),

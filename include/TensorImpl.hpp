@@ -47,37 +47,21 @@ public:
             
             if (val == (T)0) {
 #if defined(USE_CUDA)
-                if (active_stream()) {
-                    GPU_CHECK(cudaMemsetAsync(data_.get(), 0, bytes, active_stream()));
-                } else {
-                    GPU_CHECK(cudaMemset(data_.get(), 0, bytes));
-                }
+                GPU_CHECK(cudaMemsetAsync(data_.get(), 0, bytes,
+                                          active_stream() ? active_stream() : nullptr));
 #elif defined(USE_ROCM)
-                if (active_stream()) {
-                    GPU_CHECK(hipMemsetAsync(data_.get(), 0, bytes, active_stream()));
-                } else {
-                    GPU_CHECK(hipMemset(data_.get(), 0, bytes));
-                }
+                GPU_CHECK(hipMemsetAsync(data_.get(), 0, bytes,
+                                         active_stream() ? active_stream() : nullptr));
 #endif
             } else {
                 std::vector<T> temp(size_, val);
-    
+                GpuStream_t s = active_stream() ? active_stream() : nullptr;
 #if defined(USE_CUDA)
-                if (active_stream()) {
-                    GPU_CHECK(cudaMemcpyAsync(data_.get(), temp.data(), bytes,
-                                              cudaMemcpyHostToDevice, active_stream()));
-                } else {
-                    GPU_CHECK(cudaMemcpy(data_.get(), temp.data(), bytes,
-                                         cudaMemcpyHostToDevice));
-                }
+                GPU_CHECK(cudaMemcpyAsync(data_.get(), temp.data(), bytes,
+                                          cudaMemcpyHostToDevice, s));
 #elif defined(USE_ROCM)
-                if (active_stream()) {
-                    GPU_CHECK(hipMemcpyAsync(data_.get(), temp.data(), bytes,
-                                             hipMemcpyHostToDevice, active_stream()));
-                } else {
-                    GPU_CHECK(hipMemcpy(data_.get(), temp.data(), bytes,
-                                        hipMemcpyHostToDevice));
-                }
+                GPU_CHECK(hipMemcpyAsync(data_.get(), temp.data(), bytes,
+                                         hipMemcpyHostToDevice, s));
 #endif
             }
         }
