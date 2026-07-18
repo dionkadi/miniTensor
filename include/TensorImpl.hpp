@@ -7,9 +7,14 @@
 #include "Defines.hpp"
 #include "GpuUtils.hpp"
 #include "MemoryPool.hpp"
+// fill_gpu is forward-declared below to avoid circular include via TensorOps.hpp
 
 template<typename T> class Tensor;
 template<typename T> struct AutogradNode;
+
+// Forward declaration: graph-capture-safe GPU fill kernel launcher
+// (defined in gpu_ops.cpp, compiled under CUDA/HIP)
+template<typename T> void fill_gpu(T* data, T val, size_t N);
 
 // #############################
 // #
@@ -54,14 +59,13 @@ public:
                                          active_stream() ? active_stream() : nullptr));
 #endif
             } else {
-                std::vector<T> temp(size_, val);
-                GpuStream_t s = active_stream() ? active_stream() : nullptr;
-#if defined(USE_CUDA)
-                GPU_CHECK(cudaMemcpyAsync(data_.get(), temp.data(), bytes,
-                                          cudaMemcpyHostToDevice, s));
-#elif defined(USE_ROCM)
-                GPU_CHECK(hipMemcpyAsync(data_.get(), temp.data(), bytes,
-                                         hipMemcpyHostToDevice, s));
+#if defined(USE_CUDA) || defined(USE_ROCM)
+                // GPU fill kernel (graph-capture-safe) instead of H2D memcpy with
+                // a host-stack temporary whose address would be baked into the graph
+                // and become invalid on replay.
+                fill_gpu(data_.get(), val, size_);
+#else
+                // CPU fallback (shouldn't reach here for GPU tensors in CPU-only build)
 #endif
             }
         }

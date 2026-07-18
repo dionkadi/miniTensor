@@ -61,13 +61,14 @@ find_package(GTest REQUIRED)
 
 add_executable(tensor_tests 
     # test/tensor_test.cpp
-    # test/spatial_test.cpp
+    # test/benchmark.cpp
     # test/engien_test.cpp
     # test/nn_test.cpp
     # test/func_test.cpp
     # test/dataset_test.cpp
     # test/mnist.cpp
     # test/scheduler_test.cpp
+    # test/benchmark.cpp
     test/resnet.cpp
 )
 target_include_directories(tensor_tests PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)

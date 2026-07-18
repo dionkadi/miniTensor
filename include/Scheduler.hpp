@@ -256,8 +256,12 @@ public:
         int epoch = this->last_epoch_;
         if (epoch <= 0) return;
 
-        // Cosine formula with clamping after T_max
-        T cos_val = std::cos(static_cast<T>(M_PI) * epoch / T_max_);
+        // Clamp epoch to T_max to prevent warm-restart oscillation.
+        // Without this, cos(pi * epoch / T_max) oscillates after T_max,
+        // causing LR to swing back up to base_lr every 2*T_max epochs.
+        int clamped_epoch = std::min(epoch, T_max_);
+
+        T cos_val = std::cos(static_cast<T>(M_PI) * clamped_epoch / T_max_);
         T new_lr = eta_min_ + T(0.5) * (this->base_lr_ - eta_min_) * (T(1) + cos_val);
 
         // Clamp: LR should never go below eta_min_
@@ -276,9 +280,10 @@ public:
         LRScheduler<T>::load_state(f);
         f.read(reinterpret_cast<char*>(&T_max_), sizeof(T_max_));
         f.read(reinterpret_cast<char*>(&eta_min_), sizeof(T));
-        // Re-apply schedule
+        // Re-apply schedule (with same clamping as step())
         int epoch = this->last_epoch_;
-        T cos_val = std::cos(static_cast<T>(M_PI) * epoch / T_max_);
+        int clamped_epoch = std::min(epoch, T_max_);
+        T cos_val = std::cos(static_cast<T>(M_PI) * clamped_epoch / T_max_);
         T new_lr = eta_min_ + T(0.5) * (this->base_lr_ - eta_min_) * (T(1) + cos_val);
         if (new_lr < eta_min_) new_lr = eta_min_;
         this->opt_.set_lr(new_lr);

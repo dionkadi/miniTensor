@@ -26,6 +26,12 @@ public:
     
     // Returns a single sample (e.g., a feature tensor and a label tensor)
     virtual std::pair<Tensor<T>, Tensor<T>> get(size_t index) const = 0;
+
+    // Toggle train/eval mode for datasets that support augmentation
+    // (e.g. random crop+flip vs center crop). Default no-op; subclasses
+    // that need it override. Marked const because toggling a mutable
+    // mode flag does not change the logical dataset identity.
+    virtual void set_train_mode(bool /*train*/) const {}
 };
 
 template<typename T>

@@ -99,8 +99,21 @@ public:
             (void)hipDeviceSynchronize();
 #endif
             capture_graph();
+            // Device sync after capture: cudaStreamEndCapture removes the captured
+            // operations from the stream, so syncing the stream returns immediately.
+            // The captured GPU work (forward/backward/step) may still be in-flight
+            // on the device — a device-wide sync ensures static_loss_'s data and all
+            // parameter/velocity updates are visible before the caller reads them.
+#if defined(USE_CUDA)
+            (void)cudaDeviceSynchronize();
+#elif defined(USE_ROCM)
+            (void)hipDeviceSynchronize();
+#endif
             state_ = State::GRAPH_READY;
-            return replay(x, y);
+            // Don't replay here — capture_graph() already executed the full
+            // forward→backward→step. Replaying would double-apply the step,
+            // overfitting params to this batch and exploding loss on the next.
+            return static_loss_;
         }
 
         return replay(x, y);

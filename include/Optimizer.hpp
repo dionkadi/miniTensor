@@ -9,6 +9,67 @@ class Optimizer {
 protected:
     std::vector<Tensor<T>> parameters_;
 
+    // 1-element device tensor holding the current learning rate.
+    // Graph-capture-safe: the captured graph reads from lr_device_'s data
+    // pointer. When the scheduler changes lr, we overwrite the contents
+    // via sync_lr_device() — the pointer stays the same, so the captured
+    // graph picks up the new value on the next replay.
+    Tensor<T> lr_device_;
+    bool lr_device_init_ = false;
+
+    void init_lr_device(T lr) {
+        if (!lr_device_init_ && !this->parameters_.empty()) {
+            lr_device_ = Tensor<T>({1}, this->parameters_[0].device());
+            lr_device_.fill(lr);
+            lr_device_init_ = true;
+        }
+    }
+
+    void sync_lr_device(T new_lr) {
+        if (lr_device_init_) {
+            lr_device_.fill(new_lr);
+        }
+    }
+
+    // Graph-capture-safe gradient norm clipping.
+    // Computes the global L2 norm across all parameter gradients and scales
+    // them down if the norm exceeds max_norm. All operations are device-side
+    // (no D2H sync), so the entire clip is captured inside the CUDA/HIP graph.
+    void clip_grad_norm_impl(T max_norm) {
+        if (max_norm <= T(0) || this->parameters_.empty()) return;
+
+        // Accumulate sum of squared gradients into a 1-element tensor.
+        Tensor<T> total_sq({1}, this->parameters_[0].device());
+        total_sq.fill(T(0));
+
+        for (auto& p : this->parameters_) {
+            if (p.grad().empty()) continue;
+            // Flatten to 1D, square, sum all elements → {1} tensor.
+            auto flat = p.grad().reshape({p.grad().total_elements()});
+            auto sq = pow2(flat);
+            auto s = sum(sq, 0, true);
+            add_(total_sq, s);
+        }
+
+        // total_norm = sqrt(total_sq)
+        auto total_norm = sqrt(total_sq);
+
+        // clip_coeff = max_norm / (total_norm + eps)
+        auto denom = add_scalar(total_norm, T(1e-8));
+        Tensor<T> max_norm_tensor({1}, total_sq.device());
+        max_norm_tensor.fill(max_norm);
+        auto clip_coeff = div(max_norm_tensor, denom);
+
+        // scale = min(clip_coeff, 1.0) — no-op when norm <= max_norm
+        auto scale = clamp_max_scalar(clip_coeff, T(1));
+
+        // Apply scale to all gradients in-place
+        for (auto& p : this->parameters_) {
+            if (p.grad().empty()) continue;
+            mul_(p.grad(), scale);
+        }
+    }
+
 public:
     Optimizer(const std::vector<Tensor<T>>& params) : parameters_(params) {}
     virtual ~Optimizer() = default;
@@ -19,7 +80,10 @@ public:
 
     std::vector<Tensor<T>>& get_parameters() { return parameters_; }
     const std::vector<Tensor<T>>& get_parameters() const { return parameters_; }
-    
+
+    // Access the device-resident LR tensor (for graph capture).
+    Tensor<T>& lr_device() { return lr_device_; }
+
     // Checkpoint accessors for optimizer state serialization.
     // Subclasses override to expose their internal state buffers
     // (e.g. momentum velocity, Adam m/v) and scalar hyperparameters.
@@ -43,19 +107,26 @@ private:
     T lr_;
     T weight_decay_;
     T momentum_;
+    T clip_norm_;
     size_t t_ = 0;
 
     std::vector<Tensor<T>> velocity_;
 
 public:
-    SGD(const std::vector<Tensor<T>>& params, T lr, T weight_decay = (T)0.0, T momentum = (T)0.0) 
-        : Optimizer<T>(params), lr_(lr), weight_decay_(weight_decay)     
+    SGD(const std::vector<Tensor<T>>& params, T lr, T weight_decay = (T)0.0,
+        T momentum = (T)0.0, T clip_norm = (T)0.0) 
+        : Optimizer<T>(params), lr_(lr), weight_decay_(weight_decay),
+          clip_norm_(clip_norm)     
     {
         set_momentum(momentum);
+        this->init_lr_device(lr);
     }
 
     T lr() const override { return lr_; }
-    void set_lr(T lr) override { lr_ = lr; }
+    void set_lr(T lr) override { 
+        lr_ = lr; 
+        this->sync_lr_device(lr);
+    }
 
     void set_momentum(T momentum) {
         momentum_ = momentum;
@@ -72,6 +143,7 @@ public:
     std::vector<Tensor<T>>& velocity() { return velocity_; }
     T weight_decay() const { return weight_decay_; }
     T momentum() const { return momentum_; }
+    T clip_norm() const { return clip_norm_; }
 
     std::vector<Tensor<T>> state_buffers() const override { return velocity_; }
     void set_state_buffers(const std::vector<Tensor<T>>& bufs) override {
@@ -79,12 +151,14 @@ public:
             velocity_[i] = bufs[i];
     }
     std::vector<T> state_scalars() const override {
-        return {lr_, weight_decay_, momentum_};
+        return {lr_, weight_decay_, momentum_, clip_norm_};
     }
     void set_state_scalars(const std::vector<T>& s) override {
         lr_ = s[0];
         weight_decay_ = s[1];
         momentum_ = s[2];
+        if (s.size() > 3) clip_norm_ = s[3];
+        this->sync_lr_device(lr_);
     }
     size_t current_step() const override { return t_; }
     void set_step(size_t t) override { t_ = t; }
@@ -93,6 +167,16 @@ public:
     void step() override {
         ++t_;
         NoGradGuard guard; 
+
+        // Lazy init lr_device_ in case parameters weren't available at construction
+        if (!this->lr_device_init_) {
+            this->init_lr_device(lr_);
+        }
+
+        // Gradient clipping (graph-capture-safe, all device-side ops)
+        if (clip_norm_ > T(0)) {
+            this->clip_grad_norm_impl(clip_norm_);
+        }
 
         for (size_t i = 0; i < this->parameters_.size(); ++i) {
             auto& p = this->parameters_[i];
@@ -110,11 +194,21 @@ public:
                     v.fill(T(0));
                     velocity_.push_back(v);
                 }
-                velocity_[i] = velocity_[i] * momentum_ + current_grad;
-                Tensor<T> step = velocity_[i] * lr_;
+                // In-place velocity update: v = v * momentum + grad.
+                // Keeps velocity_[i] at a fixed storage address, so graph capture
+                // replays always read the current (not stale) velocity.
+                {
+                    Tensor<T> ms({1}, velocity_[i].device());
+                    ms.fill(momentum_);
+                    mul_(velocity_[i], ms);
+                    add_(velocity_[i], current_grad);
+                }
+                // Use device-resident LR tensor so graph capture reads the
+                // current lr from device memory instead of a baked scalar.
+                Tensor<T> step = velocity_[i] * this->lr_device_;
                 sub_(p, step);
             } else {
-                Tensor<T> step = current_grad * lr_;
+                Tensor<T> step = current_grad * this->lr_device_;
                 sub_(p, step);
             }
         }

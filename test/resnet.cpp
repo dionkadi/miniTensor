@@ -51,8 +51,19 @@ private:
     bool normalize_;
     
     // Random number generator for training augmentation
-    std::mt19937 rng_;
-    
+    mutable std::mt19937 rng_;
+
+    // Train/eval mode: controls augmentation (random crop + flip in train,
+    // center crop in eval). Mutable so it can be toggled between phases.
+    mutable bool train_mode_ = true;
+
+    // ImageNet normalization constants
+    static constexpr float imagenet_mean[3] = {0.485f, 0.456f, 0.406f};
+    static constexpr float imagenet_std[3]  = {0.229f, 0.224f, 0.225f};
+
+    // Padding (pixels) added around the target size for random cropping.
+    static constexpr int crop_pad_ = 8;
+
 public:
     MiniImageNetDataset(const std::string& root_dir, int target_size = 84,
                         bool normalize = true, unsigned int seed = 42)
@@ -115,7 +126,9 @@ public:
     size_t size() const override { return image_paths_.size(); }
     
     int num_classes() const { return static_cast<int>(class_to_idx_.size()); }
-    
+
+    void set_train_mode(bool mode) const override { train_mode_ = mode; }
+
     std::pair<Tensor<T>, Tensor<T>> get(size_t index) const override {
         // Load image using stb_image
         int w, h, channels;
@@ -124,21 +137,53 @@ public:
         if (!data) {
             throw std::runtime_error("Failed to load image: " + image_paths_[index]);
         }
-        
-        // Create output tensor [3, target_h, target_w]
+
+        // Padded size: resize to (target + crop_pad) then crop to target.
+        // This gives random crops in train mode and center crops in eval mode.
+        int padded_h = target_height_ + 2 * crop_pad_;
+        int padded_w = target_width_  + 2 * crop_pad_;
+
+        // Determine crop offset within the padded image
+        int crop_x, crop_y;
+        if (train_mode_) {
+            std::uniform_int_distribution<int> crop_dist(0, 2 * crop_pad_);
+            crop_x = crop_dist(rng_);
+            crop_y = crop_dist(rng_);
+        } else {
+            crop_x = crop_pad_;
+            crop_y = crop_pad_;
+        }
+
+        // Random horizontal flip (train only)
+        bool do_flip = false;
+        if (train_mode_) {
+            std::bernoulli_distribution flip_dist(0.5);
+            do_flip = flip_dist(rng_);
+        }
+
+        // Create output tensor [1, 3, target_h, target_w]
         Tensor<T> image({size_t(1), size_t(3), 
                           static_cast<size_t>(target_height_), 
                           static_cast<size_t>(target_width_)});
         T* out = image.data();
         
-        // Resize image to target size (simple bilinear interpolation)
-        float x_ratio = static_cast<float>(w) / target_width_;
-        float y_ratio = static_cast<float>(h) / target_height_;
+        // Resize source image to padded size, then crop to target.
+        // We fuse resize + crop + flip + normalize in a single pass:
+        //   for each output pixel (y, x):
+        //     map to padded coords (y + crop_y, x + crop_x), flipping x if needed
+        //     bilinear-interpolate from the original image
+        //     normalize
+        float x_ratio = static_cast<float>(w) / padded_w;
+        float y_ratio = static_cast<float>(h) / padded_h;
         
         for (int y = 0; y < target_height_; ++y) {
             for (int x = 0; x < target_width_; ++x) {
-                float src_x = x * x_ratio;
-                float src_y = y * y_ratio;
+                // Map output pixel to padded-image coordinates
+                int px = do_flip ? (target_width_ - 1 - x + crop_x) : (x + crop_x);
+                int py = y + crop_y;
+
+                float src_x = px * x_ratio;
+                float src_y = py * y_ratio;
                 
                 int x0 = static_cast<int>(src_x);
                 int y0 = static_cast<int>(src_y);
@@ -159,13 +204,14 @@ public:
                               v10 * (1 - x_frac) * y_frac +
                               v11 * x_frac * y_frac;
                     
-                    // Normalize to [0, 1] or use ImageNet normalization
+                    T out_val;
                     if (normalize_) {
-                        // Simple [0, 1] normalization
-                        out[0 * target_height_ * target_width_ + y * target_width_ + x] = v / 255.0f;
+                        // ImageNet normalization: (v/255 - mean) / std
+                        out_val = static_cast<T>((v / 255.0f - imagenet_mean[c]) / imagenet_std[c]);
                     } else {
-                        out[0 * target_height_ * target_width_ + y * target_width_ + x] = v;
+                        out_val = static_cast<T>(v / 255.0f);
                     }
+                    out[c * target_height_ * target_width_ + y * target_width_ + x] = out_val;
                 }
             }
         }
@@ -586,15 +632,16 @@ train_val_split(Dataset<T>& dataset, double val_ratio = 0.1, unsigned int seed =
     
     // Create subset datasets
     class SubsetDataset : public Dataset<T> {
-        const Dataset<T>& base_;
+        Dataset<T>& base_;  // non-const: allows train/eval mode toggling
         std::vector<size_t> indices_;
     public:
-        SubsetDataset(const Dataset<T>& base, std::vector<size_t> indices)
+        SubsetDataset(Dataset<T>& base, std::vector<size_t> indices)
             : base_(base), indices_(std::move(indices)) {}
         size_t size() const override { return indices_.size(); }
         std::pair<Tensor<T>, Tensor<T>> get(size_t index) const override {
             return base_.get(indices_[index]);
         }
+        void set_train_mode(bool mode) const override { base_.set_train_mode(mode); }
     };
     
     return {
@@ -625,10 +672,12 @@ int main() {
     std::cout << "Val samples: " << val_ds->size() << std::endl;
     
     // Create data loaders
-    const size_t batch_size = 256;
+    const size_t batch_size = 128;
     DataLoader<T> train_loader(*train_ds, batch_size, true);
     DataLoader<T> val_loader(*val_ds, batch_size, false);
     
+    std::cout << std::format("Train batches: {}\n", (train_ds->size() + batch_size - 1) / batch_size);
+
     // Create model
     std::cout << "\n[2] Creating ResNet10 model..." << std::endl;
     auto model = std::make_shared<ResNet10<T>>(num_classes);
@@ -644,23 +693,40 @@ int main() {
     }
     std::cout << "Model parameters: " << num_params << std::endl;
     
-    // Optimizer
-    Adam<T> optimizer(model->parameters(), T(0.001), T(0.9), T(0.999), T(1e-8), T(0.0001));
+    // Optimizer — SGD with momentum, weight decay, and gradient clipping.
+    // clip_norm=1.0 prevents grad explosions from lr=0.01 + momentum=0.9.
+    // The device-resident LR (lr_device_) makes scheduler changes visible
+    // inside the captured CUDA/HIP graph.
+    const T base_lr = T(0.01);
+    const int epochs = 1000;
+    const int warmup_epochs = 10;
+    SGD<T> optimizer(model->parameters(), base_lr, T(0.0001), 0.9, T(5.0));
+    // AdamW<T> optimizer(model->parameters(), T(0.001), T(0.9), T(0.999), T(1e-8), T(0.01));
     
-    GraphExecutor<T> executor(model, optimizer,
-        [](const Tensor<T>& pred, const Tensor<T>& target) {
-            return cross_entropy(pred, target);
-        });
+    GraphExecutor<T> executor(model, optimizer, cross_entropy<T>);
     
-    std::cout << "executor created\n";
+    // Cosine annealing scheduler — T_max accounts for warmup epochs.
+    // Warmup epochs use a linear LR ramp; cosine takes over afterward.
+    CosineAnnealingLR<T> scheduler(optimizer, epochs - warmup_epochs, T(1e-6));
     
-    // Cosine annealing scheduler
-    CosineAnnealingLR<T> scheduler(optimizer, 30, T(1e-6));
-    
-    const int epochs = 30;
     T best_val_acc = T(0);
     std::string best_weights_path = "best_resnet10.bin";
     int start_epoch = 0;
+    
+    // Install signal handlers
+    std::signal(SIGINT, handle_signal);
+    std::signal(SIGTERM, handle_signal);
+    
+    // Lambda for saving checkpoint (epoch end or interrupt)
+    auto save_checkpoint_now = [&](int current_epoch) {
+        save_checkpoint<T>(CHECKPOINT_PATH,
+                          model->parameters(),
+                          optimizer.state_buffers(),
+                          optimizer.current_step(),
+                          optimizer.state_scalars(),
+                          &scheduler);
+        save_checkpoint_meta(CHECKPOINT_META_PATH, current_epoch, best_val_acc);
+    };
     
     // Resume from checkpoint if one exists
     {
@@ -669,15 +735,15 @@ int main() {
             f.close();
             std::cout << "\nCheckpoint found! Loading for resumption..." << std::endl;
             auto model_params = model->parameters();
+            auto opt_buf = optimizer.state_buffers();
+            auto opt_scalars = optimizer.state_scalars();
             size_t loaded_step;
-            T lr_tmp, b1, b2, eps_tmp, wd_tmp;
             load_checkpoint_into<T>(CHECKPOINT_PATH,
-                                    model_params,
-                                    optimizer.m(),
-                                    optimizer.v(),
-                                    loaded_step,
-                                    lr_tmp, b1, b2, eps_tmp, wd_tmp,
+                                    model_params, opt_buf,
+                                    loaded_step, opt_scalars,
                                     &scheduler);
+            optimizer.set_state_buffers(opt_buf);
+            optimizer.set_state_scalars(opt_scalars);
             optimizer.set_step(loaded_step);
             
             int meta_epoch;
@@ -691,54 +757,58 @@ int main() {
         }
     }
     
-    // Install signal handlers
-    std::signal(SIGINT, handle_signal);
-    std::signal(SIGTERM, handle_signal);
-    
-    // Lambda for saving checkpoint (used both at epoch end and on interrupt)
-    auto save_checkpoint_now = [&](int current_epoch) {
-        auto ckpt_params = model->parameters();
-        const auto& const_opt = optimizer;
-        save_checkpoint<T>(CHECKPOINT_PATH,
-                          ckpt_params,
-                          const_opt.m(), const_opt.v(),
-                          const_opt.step(),
-                          const_opt.lr(), const_opt.beta1(), const_opt.beta2(),
-                          const_opt.eps(), const_opt.weight_decay(),
-                          &scheduler);
-        save_checkpoint_meta(CHECKPOINT_META_PATH, current_epoch, best_val_acc);
-    };
-    
     std::cout << "\n[3] Training for " << epochs << " epochs..." << std::endl;
     std::cout << std::fixed << std::setprecision(4);
+    
+    // GPU-resident loss accumulator (avoids per-batch D2H sync)
+    Tensor<T> loss_accum({1}, gpu);
+    
+    // Number of full training batches (drop partial last batch — graph
+    // capture requires a fixed batch shape)
+    // size_t num_full_batches = train_ds->size() / batch_size;
     
     for (int epoch = start_epoch; epoch < epochs; ++epoch) {
         auto epoch_start = std::chrono::high_resolution_clock::now();
         
         model->train();
-        T train_loss = 0;
+        full_dataset.set_train_mode(true);
+
+        // Linear warmup: ramp LR from base_lr/warmup to base_lr over warmup_epochs.
+        // After warmup, the cosine scheduler manages LR.
+        if (epoch < warmup_epochs) {
+            T warmup_lr = base_lr * T(epoch + 1) / T(warmup_epochs);
+            optimizer.set_lr(warmup_lr);
+        }
+        
+        loss_accum.fill(T(0));
         size_t train_batches = 0;
         
         for (auto [bx, by] : train_loader) {
+            // Skip partial last batch — graph capture requires fixed shape
+            if (bx.shape()[0] != batch_size) break;
+            
             auto bx_gpu = bx.to(gpu);
             auto by_gpu = by.to(gpu);
             
             auto loss = executor.step(bx_gpu, by_gpu);
-            train_loss += loss.to({DeviceType::CPU}).data()[0];
+
+            // Accumulate loss on GPU (no D2H sync per batch)
+            add_(loss_accum, loss);
             ++train_batches;
 
             if (g_interrupted) {
-                save_checkpoint_now(epoch);
-                std::cout << "\nInterrupted during epoch " << epoch + 1
-                          << "! Checkpoint saved. Exiting." << std::endl;
+                save_checkpoint_now(std::max(0, epoch - 1));
+                std::cout << "Interrupted by user\n";
                 return 0;
             }
         }
         
-        T avg_train_loss = train_loss / train_batches;
+        // Single D2H sync at epoch end
+        T avg_train_loss = loss_accum.to({DeviceType::CPU}).data()[0] / T(train_batches);
         
         // Validation phase
         model->eval();
+        full_dataset.set_train_mode(false);
         T val_loss = 0;
         T val_acc = 0;
         size_t val_batches = 0;
@@ -766,6 +836,7 @@ int main() {
         double epoch_sec = std::chrono::duration<double>(epoch_end - epoch_start).count();
         
         std::cout << "Epoch " << std::setw(2) << epoch + 1 << "/" << epochs
+                  << " | lr: " << std::setprecision(6) << optimizer.lr()
                   << " | train_loss: " << std::setprecision(4) << avg_train_loss
                   << " | val_loss: " << avg_val_loss
                   << " | val_acc: " << std::setprecision(2) << (avg_val_acc * 100) << "%"
@@ -782,12 +853,16 @@ int main() {
         // Save checkpoint for training resumption
         save_checkpoint_now(epoch);
         
-        // Step scheduler (decays LR for next epoch)
-        scheduler.step();
+        // Step scheduler only after warmup completes.
+        // During warmup, LR is managed by the linear ramp above.
+        if (epoch >= warmup_epochs) {
+            scheduler.step();
+        }
         
         // Graceful shutdown on SIGINT/SIGTERM (catch interrupts during validation)
         if (g_interrupted) {
             std::cout << "\nInterrupted! Checkpoint saved. Exiting." << std::endl;
+            save_checkpoint_now(epoch);
             return 0;
         }
     }

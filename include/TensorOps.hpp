@@ -41,6 +41,14 @@ template<typename T> struct MulScalarOp {
     HD_INLINE T operator()(T a) const { return a * scalar; } 
 };
 
+// Clamp to a maximum value: min(a, max_val). Used for gradient clipping.
+// No backward needed — always used under NoGradGuard.
+template<typename T> struct ClampMaxScalarOp { 
+    T max_val;
+    HD_INLINE ClampMaxScalarOp(T m) : max_val(m) {}
+    HD_INLINE T operator()(T a) const { return a > max_val ? max_val : a; } 
+};
+
 template<typename T> struct ReLUOp { 
     HD_INLINE T operator()(T a) const { return a > (T)0.0 ? a : (T)0.0; }
 };
@@ -712,6 +720,7 @@ template<typename T> void cross_entropy_bwd_gpu(const Tensor<T>&, const Tensor<T
 template<typename T> void adam_step_gpu(Tensor<T>& param, const Tensor<T>& grad, Tensor<T>& m, Tensor<T>& v, T lr, T beta1, T beta2, T eps, T bias_correction1, T bias_correction2, T weight_decay);
 template<typename T> void adamw_step_gpu(Tensor<T>& param, const Tensor<T>& grad, Tensor<T>& m, Tensor<T>& v, T lr, T beta1, T beta2, T eps, T bias_correction1, T bias_correction2, T weight_decay);
 template<typename T> Tensor<T> softmax_gpu(const Tensor<T>& input);
+template<typename T> void fill_gpu(T* data, T val, size_t N);
 template<typename T> void add_relu_gpu(const Tensor<T>& A, const Tensor<T>& B, Tensor<T>& C);
 template<typename T> void bn_fwd_gpu(const Tensor<T>& input, Tensor<T>& mean, Tensor<T>& var);
 template<typename T> void bn_relu_fwd_gpu(const Tensor<T>& input, Tensor<T>& output, const Tensor<T>& mean, const Tensor<T>& var, const Tensor<T>& gamma, const Tensor<T>& beta, T eps);
@@ -893,6 +902,13 @@ Tensor<T> mul_scalar(const Tensor<T>& A, T scalar) {
 template<typename T>
 Tensor<T> operator*(const Tensor<T>& A, T scalar) { 
     return mul_scalar(A, scalar); 
+}
+
+// Clamp each element to a maximum value: min(a, max_val).
+// Used for gradient norm clipping (always under NoGradGuard).
+template<typename T>
+Tensor<T> clamp_max_scalar(const Tensor<T>& A, T max_val) { 
+    return dispatch_unary<T, ClampMaxScalarOp<T>, Pow2Backward<T>>(A, ClampMaxScalarOp<T>{max_val});
 }
 
 template<typename T>

@@ -161,14 +161,11 @@ void test_scheduler_checkpoint_roundtrip() {
 
     // Save checkpoint with scheduler
     {
-        auto params_a = model_a.parameters();
-        const auto& const_opt_a = opt_a;
         save_checkpoint<T>("/tmp/sched_ckpt.bin",
-                           params_a,
-                           const_opt_a.m(), const_opt_a.v(),
-                           const_opt_a.step(),
-                           const_opt_a.lr(), const_opt_a.beta1(), const_opt_a.beta2(),
-                           const_opt_a.eps(), const_opt_a.weight_decay(),
+                           model_a.parameters(),
+                           opt_a.state_buffers(),
+                           opt_a.current_step(),
+                           opt_a.state_scalars(),
                            &sched_a);
     }
 
@@ -180,14 +177,16 @@ void test_scheduler_checkpoint_roundtrip() {
     // Load checkpoint with scheduler
     {
         auto params_b = model_b.parameters();
+        auto opt_buf = opt_b.state_buffers();
+        auto opt_scalars = opt_b.state_scalars();
         size_t loaded_step;
-        T lr_tmp, b1, b2, eps_tmp, wd_tmp;
         load_checkpoint_into<T>("/tmp/sched_ckpt.bin",
-                                params_b,
-                                opt_b.m(), opt_b.v(),
-                                loaded_step,
-                                lr_tmp, b1, b2, eps_tmp, wd_tmp,
+                                params_b, opt_buf,
+                                loaded_step, opt_scalars,
                                 &sched_b);
+        opt_b.set_state_buffers(opt_buf);
+        opt_b.set_state_scalars(opt_scalars);
+        opt_b.set_step(loaded_step);
     }
 
     // Verify LR was restored

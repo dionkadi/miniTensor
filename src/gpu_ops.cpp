@@ -288,7 +288,14 @@ __global__ void sgemm_kernel(
         int load_b_gmem_k = load_b_smem_k;
         int load_b_gmem_addr = load_b_gmem_k * N + load_b_gmem_n;
         if (load_a_gmem_m < M && load_a_gmem_k + 3 < K) {
-            cast<float4>(&r_load_a[0]) = cast<float4>(&a[load_a_gmem_addr]);
+            if ((load_a_gmem_addr & 3) == 0)
+                cast<float4>(&r_load_a[0]) = cast<float4>(&a[load_a_gmem_addr]);
+            else {
+                r_load_a[0] = a[load_a_gmem_addr];
+                r_load_a[1] = a[load_a_gmem_addr + 1];
+                r_load_a[2] = a[load_a_gmem_addr + 2];
+                r_load_a[3] = a[load_a_gmem_addr + 3];
+            }
         } else if (load_a_gmem_m < M && load_a_gmem_k < K) {
             for (int j = 0; j < 4 && load_a_gmem_k + j < K; ++j)
                 r_load_a[j] = a[load_a_gmem_addr + j];
@@ -298,7 +305,14 @@ __global__ void sgemm_kernel(
             r_load_a[0] = 0.0f; r_load_a[1] = 0.0f; r_load_a[2] = 0.0f; r_load_a[3] = 0.0f;
         }
         if (load_b_gmem_k < K && load_b_gmem_n + 3 < N) {
-            cast<float4>(&r_load_b[0]) = cast<float4>(&b[load_b_gmem_addr]);
+            if ((load_b_gmem_addr & 3) == 0)
+                cast<float4>(&r_load_b[0]) = cast<float4>(&b[load_b_gmem_addr]);
+            else {
+                r_load_b[0] = b[load_b_gmem_addr];
+                r_load_b[1] = b[load_b_gmem_addr + 1];
+                r_load_b[2] = b[load_b_gmem_addr + 2];
+                r_load_b[3] = b[load_b_gmem_addr + 3];
+            }
         } else if (load_b_gmem_k < K && load_b_gmem_n < N) {
             for (int j = 0; j < 4 && load_b_gmem_n + j < N; ++j)
                 r_load_b[j] = b[load_b_gmem_addr + j];
@@ -326,7 +340,14 @@ __global__ void sgemm_kernel(
         int load_b_gmem_k = bk * BK + load_b_smem_k;
         int load_b_gmem_addr = load_b_gmem_k * N + load_b_gmem_n;
         if (load_a_gmem_m < M && load_a_gmem_k + 3 < K) {
-            cast<float4>(&r_load_a[0]) = cast<float4>(&a[load_a_gmem_addr]);
+            if ((load_a_gmem_addr & 3) == 0)
+                cast<float4>(&r_load_a[0]) = cast<float4>(&a[load_a_gmem_addr]);
+            else {
+                r_load_a[0] = a[load_a_gmem_addr];
+                r_load_a[1] = a[load_a_gmem_addr + 1];
+                r_load_a[2] = a[load_a_gmem_addr + 2];
+                r_load_a[3] = a[load_a_gmem_addr + 3];
+            }
         } else if (load_a_gmem_m < M && load_a_gmem_k < K) {
             for (int j = 0; j < 4 && load_a_gmem_k + j < K; ++j)
                 r_load_a[j] = a[load_a_gmem_addr + j];
@@ -336,7 +357,14 @@ __global__ void sgemm_kernel(
             r_load_a[0] = 0.0f; r_load_a[1] = 0.0f; r_load_a[2] = 0.0f; r_load_a[3] = 0.0f;
         }
         if (load_b_gmem_k < K && load_b_gmem_n + 3 < N) {
-            cast<float4>(&r_load_b[0]) = cast<float4>(&b[load_b_gmem_addr]);
+            if ((load_b_gmem_addr & 3) == 0)
+                cast<float4>(&r_load_b[0]) = cast<float4>(&b[load_b_gmem_addr]);
+            else {
+                r_load_b[0] = b[load_b_gmem_addr];
+                r_load_b[1] = b[load_b_gmem_addr + 1];
+                r_load_b[2] = b[load_b_gmem_addr + 2];
+                r_load_b[3] = b[load_b_gmem_addr + 3];
+            }
         } else if (load_b_gmem_k < K && load_b_gmem_n < N) {
             for (int j = 0; j < 4 && load_b_gmem_n + j < N; ++j)
                 r_load_b[j] = b[load_b_gmem_addr + j];
@@ -693,9 +721,14 @@ __global__ void batched_sgemm_kernel_v2(
     {
         int g_ak = a_ck;
         if (g_row < M && g_ak < K) {
-            if (g_ak + 1 < K)
-                cast<float2>(&r_a[0]) = cast<float2>(&a[static_cast<size_t>(g_row) * K + g_ak]);
-            else {
+            if (g_ak + 1 < K) {
+                size_t a_addr = static_cast<size_t>(g_row) * K + g_ak;
+                if ((a_addr & 1) == 0)
+                    cast<float2>(&r_a[0]) = cast<float2>(&a[a_addr]);
+                else {
+                    r_a[0] = a[a_addr]; r_a[1] = a[a_addr + 1];
+                }
+            } else {
                 r_a[0] = a[static_cast<size_t>(g_row) * K + g_ak]; r_a[1] = 0.0f;
             }
         } else {
@@ -703,9 +736,14 @@ __global__ void batched_sgemm_kernel_v2(
         }
         int g_bk_val = b_k;
         if (g_bk_val < K && g_n < N) {
-            if (g_n + 1 < N)
-                cast<float2>(&r_b[0]) = cast<float2>(&b_batch[static_cast<size_t>(g_bk_val) * N + g_n]);
-            else {
+            if (g_n + 1 < N) {
+                size_t b_addr = static_cast<size_t>(g_bk_val) * N + g_n;
+                if ((b_addr & 1) == 0)
+                    cast<float2>(&r_b[0]) = cast<float2>(&b_batch[b_addr]);
+                else {
+                    r_b[0] = b_batch[b_addr]; r_b[1] = b_batch[b_addr + 1];
+                }
+            } else {
                 r_b[0] = b_batch[static_cast<size_t>(g_bk_val) * N + g_n]; r_b[1] = 0.0f;
             }
         } else {
@@ -727,9 +765,14 @@ __global__ void batched_sgemm_kernel_v2(
         {
             int g_ak = tile * BK + a_ck;
             if (g_row < M && g_ak < K) {
-                if (g_ak + 1 < K)
-                    cast<float2>(&r_a[0]) = cast<float2>(&a[static_cast<size_t>(g_row) * K + g_ak]);
-                else {
+                if (g_ak + 1 < K) {
+                    size_t a_addr = static_cast<size_t>(g_row) * K + g_ak;
+                    if ((a_addr & 1) == 0)
+                        cast<float2>(&r_a[0]) = cast<float2>(&a[a_addr]);
+                    else {
+                        r_a[0] = a[a_addr]; r_a[1] = a[a_addr + 1];
+                    }
+                } else {
                     r_a[0] = a[static_cast<size_t>(g_row) * K + g_ak]; r_a[1] = 0.0f;
                 }
             } else {
@@ -740,9 +783,14 @@ __global__ void batched_sgemm_kernel_v2(
         {
             int g_bk_val = tile * BK + b_k;
             if (g_bk_val < K && g_n < N) {
-                if (g_n + 1 < N)
-                    cast<float2>(&r_b[0]) = cast<float2>(&b_batch[static_cast<size_t>(g_bk_val) * N + g_n]);
-                else {
+                if (g_n + 1 < N) {
+                    size_t b_addr = static_cast<size_t>(g_bk_val) * N + g_n;
+                    if ((b_addr & 1) == 0)
+                        cast<float2>(&r_b[0]) = cast<float2>(&b_batch[b_addr]);
+                    else {
+                        r_b[0] = b_batch[b_addr]; r_b[1] = b_batch[b_addr + 1];
+                    }
+                } else {
                     r_b[0] = b_batch[static_cast<size_t>(g_bk_val) * N + g_n]; r_b[1] = 0.0f;
                 }
             } else {
@@ -914,7 +962,12 @@ __global__ void sgemm_kernel_v2(
         int g_ak = a_ck;  // K index for this A tile
         if (g_row < M && g_ak < K) {
             if (g_ak + 1 < K) {
-                cast<float2>(&r_a[0]) = cast<float2>(&A[static_cast<size_t>(g_row) * K + g_ak]);
+                size_t a_addr = static_cast<size_t>(g_row) * K + g_ak;
+                if ((a_addr & 1) == 0)
+                    cast<float2>(&r_a[0]) = cast<float2>(&A[a_addr]);
+                else {
+                    r_a[0] = A[a_addr]; r_a[1] = A[a_addr + 1];
+                }
             } else {
                 r_a[0] = A[static_cast<size_t>(g_row) * K + g_ak]; r_a[1] = 0.0f;
             }
@@ -924,7 +977,12 @@ __global__ void sgemm_kernel_v2(
         int g_bk_val = b_k;  // K index for this B tile
         if (g_bk_val < K && g_bn < N) {
             if (g_bn + 1 < N) {
-                cast<float2>(&r_b[0]) = cast<float2>(&B[static_cast<size_t>(g_bk_val) * N + g_bn]);
+                size_t b_addr = static_cast<size_t>(g_bk_val) * N + g_bn;
+                if ((b_addr & 1) == 0)
+                    cast<float2>(&r_b[0]) = cast<float2>(&B[b_addr]);
+                else {
+                    r_b[0] = B[b_addr]; r_b[1] = B[b_addr + 1];
+                }
             } else {
                 r_b[0] = B[static_cast<size_t>(g_bk_val) * N + g_bn]; r_b[1] = 0.0f;
             }
@@ -948,9 +1006,14 @@ __global__ void sgemm_kernel_v2(
         {
             int g_ak = tile * BK + a_ck;
             if (g_row < M && g_ak < K) {
-                if (g_ak + 1 < K)
-                    cast<float2>(&r_a[0]) = cast<float2>(&A[static_cast<size_t>(g_row) * K + g_ak]);
-                else {
+                if (g_ak + 1 < K) {
+                    size_t a_addr = static_cast<size_t>(g_row) * K + g_ak;
+                    if ((a_addr & 1) == 0)
+                        cast<float2>(&r_a[0]) = cast<float2>(&A[a_addr]);
+                    else {
+                        r_a[0] = A[a_addr]; r_a[1] = A[a_addr + 1];
+                    }
+                } else {
                     r_a[0] = A[static_cast<size_t>(g_row) * K + g_ak]; r_a[1] = 0.0f;
                 }
             } else {
@@ -961,9 +1024,14 @@ __global__ void sgemm_kernel_v2(
         {
             int g_bk_val = tile * BK + b_k;
             if (g_bk_val < K && g_bn < N) {
-                if (g_bn + 1 < N)
-                    cast<float2>(&r_b[0]) = cast<float2>(&B[static_cast<size_t>(g_bk_val) * N + g_bn]);
-                else {
+                if (g_bn + 1 < N) {
+                    size_t b_addr = static_cast<size_t>(g_bk_val) * N + g_bn;
+                    if ((b_addr & 1) == 0)
+                        cast<float2>(&r_b[0]) = cast<float2>(&B[b_addr]);
+                    else {
+                        r_b[0] = B[b_addr]; r_b[1] = B[b_addr + 1];
+                    }
+                } else {
                     r_b[0] = B[static_cast<size_t>(g_bk_val) * N + g_bn]; r_b[1] = 0.0f;
                 }
             } else {
@@ -1068,6 +1136,27 @@ void matmul_gpu(const Tensor<T>& A, const Tensor<T>& B, Tensor<T>& C) {
         );
     }
 
+#if defined(USE_CUDA) || defined(USE_ROCM)
+    GPU_CHECK(get_last_error_capture_safe());
+#endif
+}
+
+// #######################################################
+// #   Fill GPU Kernel (graph-capture-safe constant fill)
+// #######################################################
+template<typename T>
+__global__ void fill_kernel(T* data, T val, size_t N) {
+    size_t idx = blockDim.x * blockIdx.x + threadIdx.x;
+    if (idx < N) data[idx] = val;
+}
+
+template<typename T>
+void fill_gpu(T* data, T val, size_t N) {
+    if (N == 0) return;
+    int threads = 256;
+    int blocks = static_cast<int>((N + threads - 1) / threads);
+    if (blocks == 0) return;
+    fill_kernel<T><<<blocks, threads, 0, active_stream()>>>(data, val, N);
 #if defined(USE_CUDA) || defined(USE_ROCM)
     GPU_CHECK(get_last_error_capture_safe());
 #endif
@@ -3307,6 +3396,8 @@ template void unary_gpu<float, AddScalarOp<float>>(Tensor<float> const&, Tensor<
 template void unary_gpu_strided<float, AddScalarOp<float>>(Tensor<float> const&, Tensor<float>&, AddScalarOp<float>);
 template void unary_gpu<float, SqrtOp<float>>(Tensor<float> const&, Tensor<float>&, SqrtOp<float>);
 template void unary_gpu_strided<float, SqrtOp<float>>(Tensor<float> const&, Tensor<float>&, SqrtOp<float>);
+template void unary_gpu<float, ClampMaxScalarOp<float>>(Tensor<float> const&, Tensor<float>&, ClampMaxScalarOp<float>);
+template void unary_gpu_strided<float, ClampMaxScalarOp<float> >(Tensor<float> const&, Tensor<float>&, ClampMaxScalarOp<float>);
 
 template void matmul_gpu<float>(const Tensor<float>&, const Tensor<float>&, Tensor<float>&);
 template void matmul_gpu_strided<float>(const Tensor<float>&, const Tensor<float>&, Tensor<float>&);
@@ -3332,3 +3423,4 @@ template void cross_entropy_bwd_gpu<float>(const Tensor<float>&, const Tensor<fl
 template void adam_step_gpu<float>(Tensor<float>&, const Tensor<float>&, Tensor<float>&, Tensor<float>&, float, float, float, float, float, float, float);
 template void adamw_step_gpu<float>(Tensor<float>&, const Tensor<float>&, Tensor<float>&, Tensor<float>&, float, float, float, float, float, float, float);
 template Tensor<float> softmax_gpu<float>(const Tensor<float>&);
+template void fill_gpu<float>(float*, float, size_t);

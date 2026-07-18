@@ -91,6 +91,7 @@ public:
 
     bool requires_grad() const noexcept { return impl_->requires_grad_; }
     void set_requires_grad(bool req) noexcept { impl_->requires_grad_ = req; }
+    Self& grad() { return impl_->grad_; }
     const Self& grad() const { return impl_->grad_; }
     void accumulate_grad(const Self& gradient) {
         if (impl_->grad_.empty()) {
