@@ -2,10 +2,12 @@
 
 #include "Defines.hpp"
 #include "TensorOps.hpp"
+#include "GpuUtils.hpp"
 
 #include <vector>
 #include <random>
 #include <memory>
+#include <algorithm>
 
 template<typename T> class Tensor;
 
@@ -296,6 +298,10 @@ public:
     Tensor<T> beta_;
     Tensor<T> running_mean_;
     Tensor<T> running_var_;
+    // Batch stats of the last training forward (shallow refs: keep the
+    // captured graph's stat buffers alive and hand them to the device fold).
+    Tensor<T> last_mean_;
+    Tensor<T> last_var_;
     T eps_;
     T momentum_;
 public:
@@ -311,8 +317,53 @@ public:
         running_mean_.fill(T(0));
         running_var_ = Tensor<T>({num_features}, device);
         running_var_.fill(T(1));
+        instances().push_back(this);
     }
 
+    ~BatchNorm2d() {
+        auto& v = instances();
+        v.erase(std::remove(v.begin(), v.end(), this), v.end());
+    }
+
+    // All live BatchNorm2d instances, so GraphExecutor can fold running
+    // stats after each graph replay (heap-allocated vector to avoid
+    // static-destruction-order issues).
+    static std::vector<BatchNorm2d<T>*>& instances() {
+        static std::vector<BatchNorm2d<T>*>* v = new std::vector<BatchNorm2d<T>*>();
+        return *v;
+    }
+
+    // Device-side EMA fold for every live BN. Called by GraphExecutor::replay()
+    // after its capture-stream sync (and inline from forward_impl in eager
+    // mode). Reads last_mean_/last_var_ (refreshed by the replay) and updates
+    // running_mean_/running_var_ with plain kernels.
+    static void fold_all() {
+        for (auto* bn : instances()) bn->fold_running_stats();
+    }
+
+private:
+    // running_stat = (1-momentum) * running_stat + momentum * batch_stat
+    // (momentum=0.1 -> 90% history, 10% current batch, PyTorch convention).
+    // Runs as plain device kernels OUTSIDE any captured graph: in-graph
+    // in-place writes to pre-existing memory are unreliable on HIP
+    // (ROCm/hip#3887 stale-memory family), and host-side copies would add a
+    // blocking roundtrip + stream drain per BN per batch. Device kernels
+    // cost nothing and need no sync.
+    void fold_running_stats() {
+#if defined(USE_CUDA) || defined(USE_ROCM)
+        if (last_mean_.empty() || last_mean_.device().type != DeviceType::CUDA) return;
+        size_t C = running_mean_.total_elements();
+        NoGradGuard guard;
+        Tensor<T> keep({1}, running_mean_.device());
+        keep.fill(T(1) - momentum_);
+        mul_(running_mean_, keep);
+        add_(running_mean_, last_mean_.reshape({C}) * momentum_);
+        mul_(running_var_, keep);
+        add_(running_var_, last_var_.reshape({C}) * momentum_);
+#endif
+    }
+
+public:
     Tensor<T> forward(const Tensor<T>& x) override {
         return forward_impl(x, false);
     }
@@ -330,31 +381,61 @@ private:
         T spatial_size = T(N * H * W);
 
         Tensor<T> mean, var;
-#if defined(USE_CUDA) || defined(USE_ROCM)
-        if (x.device().type == DeviceType::CUDA) {
-            // Fused BN forward: single kernel computes mean + var
-            mean = Tensor<T>({1, C, 1, 1}, x.device());
-            var  = Tensor<T>({1, C, 1, 1}, x.device());
-            bn_fwd_gpu(x, mean, var);
-        } else {
-#endif
-            mean = sum(x, 0, true);
-            mean = sum(mean, 2, true);
-            mean = sum(mean, 3, true);
-            mean = mean * (T(1) / spatial_size);
-
-            auto centered = x - mean;
-            var = sum(pow2(centered), 0, true);
-            var = sum(var, 2, true);
-            var = sum(var, 3, true);
-            var = var * (T(1) / spatial_size);
-#if defined(USE_CUDA) || defined(USE_ROCM)
-        }
-#endif
         if (this->is_training_) {
-            NoGradGuard guard;
-            running_mean_ = running_mean_ * momentum_ + mean.reshape({C}) * (T(1) - momentum_);
-            running_var_  = running_var_  * momentum_ + var.reshape({C})  * (T(1) - momentum_);
+            // Training: compute batch statistics, update running stats in-place.
+#if defined(USE_CUDA) || defined(USE_ROCM)
+            if (x.device().type == DeviceType::CUDA) {
+                // Fused BN forward: single kernel computes mean + var
+                mean = Tensor<T>({1, C, 1, 1}, x.device());
+                var  = Tensor<T>({1, C, 1, 1}, x.device());
+                bn_fwd_gpu(x, mean, var);
+            } else {
+#endif
+                mean = sum(x, 0, true);
+                mean = sum(mean, 2, true);
+                mean = sum(mean, 3, true);
+                mean = mean * (T(1) / spatial_size);
+
+                auto centered = x - mean;
+                var = sum(pow2(centered), 0, true);
+                var = sum(var, 2, true);
+                var = sum(var, 3, true);
+                var = var * (T(1) / spatial_size);
+#if defined(USE_CUDA) || defined(USE_ROCM)
+            }
+#endif
+            // Running-stat EMA update, kept OUT of any captured graph: in-graph
+            // in-place writes to pre-existing memory do not persist reliably on
+            // HIP (ROCm/hip#3887 stale-memory family), so the fold runs as plain
+            // device kernels after the step instead.
+            //  - eager mode (active_stream() == nullptr): fold inline below;
+            //  - graph mode: BatchNorm2d<T>::fold_all() is invoked by
+            //    GraphExecutor::replay() after its stream sync.
+            last_mean_ = mean;
+            last_var_  = var;
+#if defined(USE_CUDA) || defined(USE_ROCM)
+            if (x.device().type == DeviceType::CUDA) {
+                if (active_stream() == nullptr) {
+                    fold_running_stats();
+                }
+            } else
+#endif
+            {
+                // CPU path: in-place EMA (no graph involvement).
+                NoGradGuard guard;
+                // running_stat = (1-momentum) * running_stat + momentum * batch_stat
+                // momentum=0.1 → 90% history, 10% current batch (PyTorch convention).
+                Tensor<T> keep({1}, running_mean_.device());
+                keep.fill(T(1) - momentum_);
+                mul_(running_mean_, keep);
+                add_(running_mean_, mean.reshape({C}) * momentum_);
+                mul_(running_var_, keep);
+                add_(running_var_, var.reshape({C}) * momentum_);
+            }
+        } else {
+            // Eval: normalize with stored running statistics, not batch stats.
+            mean = view_reshape(running_mean_, {1, C, 1, 1});
+            var  = view_reshape(running_var_,  {1, C, 1, 1});
         }
 
 #if defined(USE_CUDA) || defined(USE_ROCM)
@@ -362,6 +443,36 @@ private:
             Tensor<T> output(x.shape(), x.device());
             bn_relu_fwd_gpu(x, output, mean, var, gamma_, beta_, eps_);
             return output;
+        }
+#endif
+
+#if defined(USE_CUDA) || defined(USE_ROCM)
+        if (x.device().type == DeviceType::CUDA && this->is_training_) {
+            // GPU training path: mean/var from bn_fwd_gpu (raw kernel) have no
+            // autograd chain, so the decomposed (x-μ)/σ·γ+β gives biased gradients
+            // missing the ∂μ/∂x and ∂σ/∂x correction terms.
+            // Use BatchNormBackward with the fused bn_bwd_gpu kernel instead.
+            Tensor<T> bn_out;
+            {
+                NoGradGuard guard;
+                auto centered = x - mean;
+                auto inv_std  = sqrt(var + eps_);
+                auto x_hat    = centered / inv_std;
+                bn_out = x_hat * view_reshape(gamma_, {1, C, 1, 1})
+                       + view_reshape(beta_,  {1, C, 1, 1});
+            }
+            if (GradMode::is_enabled()) {
+                bn_out.set_requires_grad(
+                    x.requires_grad() || gamma_.requires_grad() || beta_.requires_grad());
+                if (bn_out.requires_grad()) {
+                    bn_out.set_grad_fn(std::make_shared<BatchNormBackward<T>>(
+                        x, mean, var, gamma_, beta_, eps_));
+                }
+            }
+            if (apply_relu) {
+                return relu(bn_out);
+            }
+            return bn_out;
         }
 #endif
 
@@ -406,7 +517,10 @@ public:
         std::mt19937 gen(std::random_device{}());
         std::bernoulli_distribution dist(p_keep);
 
-        Tensor<T> mask(x.shape(), x.device());
+        // Mask is generated on the HOST (std::mt19937 below), so it must be
+        // allocated on CPU — writing through data() of a GPU tensor would be a
+        // host write to device memory (SIGSEGV). Moved to x.device() after.
+        Tensor<T> mask(x.shape());
         T* m_data = mask.data();
         for (size_t i = 0; i < mask.total_elements(); ++i) {
             m_data[i] = dist(gen) ? T(1) : T(0);

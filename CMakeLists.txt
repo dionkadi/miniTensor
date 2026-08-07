@@ -58,6 +58,7 @@ elseif(USE_ROCM)
 endif()
 
 find_package(GTest REQUIRED)
+find_package(fmt REQUIRED)
 
 add_executable(tensor_tests 
     # test/tensor_test.cpp
@@ -100,4 +101,5 @@ target_link_libraries(tensor_tests
     tensor
     GTest::gtest
     GTest::gtest_main
+    fmt::fmt
 )

@@ -724,6 +724,7 @@ template<typename T> void fill_gpu(T* data, T val, size_t N);
 template<typename T> void add_relu_gpu(const Tensor<T>& A, const Tensor<T>& B, Tensor<T>& C);
 template<typename T> void bn_fwd_gpu(const Tensor<T>& input, Tensor<T>& mean, Tensor<T>& var);
 template<typename T> void bn_relu_fwd_gpu(const Tensor<T>& input, Tensor<T>& output, const Tensor<T>& mean, const Tensor<T>& var, const Tensor<T>& gamma, const Tensor<T>& beta, T eps);
+template<typename T> void bn_bwd_gpu(const Tensor<T>& grad_output, const Tensor<T>& input, const Tensor<T>& mean, const Tensor<T>& var, const Tensor<T>& gamma, T eps, Tensor<T>& grad_input, Tensor<T>& grad_gamma, Tensor<T>& grad_beta);
 #endif
 
 // #############################

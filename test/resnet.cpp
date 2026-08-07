@@ -2,6 +2,26 @@
 // Tests: BatchNorm2d, Dropout, LayerNorm, Functional API, Skip connections,
 //        Model serialization, ONNX-like graph export, Async DataLoader
 
+// NOTE: standard/library includes MUST come before the miniTensor headers.
+// The HIP headers (via Tensor.hpp -> GpuUtils.hpp) define __noinline__ as a
+// macro; GCC 16's <chrono> -> <format> uses [[__gnu__::__noinline__]] literally,
+// which fails to parse when the macro is active. Ordering std includes first
+// avoids the conflict (applies to any TU that mixes HIP headers + <chrono>).
+#include <fmt/base.h>
+#include <fstream>
+#include <stdexcept>
+#include <cstdint>
+#include <iostream>
+#include <chrono>
+#include <iomanip>
+#include <algorithm>
+#include <cmath>
+#include <random>
+#include <map>
+#include <dirent.h>
+#include <sys/stat.h>
+#include <csignal>
+
 #include "Dataset.hpp"
 #include "Tensor.hpp"
 #include "TensorOps.hpp"
@@ -11,22 +31,7 @@
 #include "Serialization.hpp"
 #include "GraphExport.hpp"
 #include "Functional.hpp"
-#include "GraphExecutor.hpp"
 #include "Scheduler.hpp"
-
-#include <format>
-#include <fstream>
-#include <stdexcept>
-#include <cstdint>
-#include <iostream>
-#include <chrono>
-#include <iomanip>
-#include <algorithm>
-#include <random>
-#include <map>
-#include <dirent.h>
-#include <sys/stat.h>
-#include <csignal>
 
 // STB image loader (single-header library)
 #define STB_IMAGE_IMPLEMENTATION
@@ -38,6 +43,40 @@
 // Structure: data/miniImagenet/<class_name>/<image_files>.JPEG
 // 100 classes, 600 images per class = 60,000 total
 // Variable image sizes (resize to target size during loading)
+// Pipeline: one-time RAM cache at padded size (target + crop pad, uint8);
+// train mode applies random crop + flip + color jitter + random erasing,
+// eval mode uses a center crop. Normalized with ImageNet stats.
+
+// Bilinear RGB resize (uint8). Maps dst pixel (dx,dy) to src coords with
+// x_ratio = sw/dw, y_ratio = sh/dh, clamped 4-tap interpolation.
+static void resize_rgb_bilinear(const unsigned char* src, int sw, int sh,
+                                unsigned char* dst, int dw, int dh) {
+    float x_ratio = static_cast<float>(sw) / dw;
+    float y_ratio = static_cast<float>(sh) / dh;
+    for (int dy = 0; dy < dh; ++dy) {
+        float src_y = dy * y_ratio;
+        int y0 = static_cast<int>(src_y);
+        int y1 = std::min(y0 + 1, sh - 1);
+        float y_frac = src_y - y0;
+        for (int dx = 0; dx < dw; ++dx) {
+            float src_x = dx * x_ratio;
+            int x0 = static_cast<int>(src_x);
+            int x1 = std::min(x0 + 1, sw - 1);
+            float x_frac = src_x - x0;
+            for (int c = 0; c < 3; ++c) {
+                float v00 = src[(y0 * sw + x0) * 3 + c];
+                float v01 = src[(y0 * sw + x1) * 3 + c];
+                float v10 = src[(y1 * sw + x0) * 3 + c];
+                float v11 = src[(y1 * sw + x1) * 3 + c];
+                float v = v00 * (1 - x_frac) * (1 - y_frac) +
+                          v01 * x_frac * (1 - y_frac) +
+                          v10 * (1 - x_frac) * y_frac +
+                          v11 * x_frac * y_frac;
+                dst[(dy * dw + dx) * 3 + c] = static_cast<unsigned char>(v + 0.5f);
+            }
+        }
+    }
+}
 
 template<typename T>
 class MiniImageNetDataset : public Dataset<T> {
@@ -49,6 +88,9 @@ private:
     int target_height_;
     int target_width_;
     bool normalize_;
+    bool cache_images_;
+    std::vector<unsigned char> cache_;
+    bool has_cache_ = false;
     
     // Random number generator for training augmentation
     mutable std::mt19937 rng_;
@@ -66,9 +108,10 @@ private:
 
 public:
     MiniImageNetDataset(const std::string& root_dir, int target_size = 84,
-                        bool normalize = true, unsigned int seed = 42)
+                        bool normalize = true, unsigned int seed = 42,
+                        bool cache_images = true)
         : target_height_(target_size), target_width_(target_size),
-          normalize_(normalize), rng_(seed)
+          normalize_(normalize), cache_images_(cache_images), rng_(seed)
     {
         // Scan all class directories
         DIR* dir = opendir(root_dir.c_str());
@@ -121,6 +164,26 @@ public:
         }
         
         std::cout << "Total images: " << image_paths_.size() << std::endl;
+
+        // One-time RAM cache: every image resized to padded (target + crop pad)
+        // resolution as uint8 RGB. For target 84 + pad 8 this is 60K x 100 x 100
+        // x 3 bytes ≈ 1.8 GB; the build takes a few minutes.
+        if (cache_images_ && !image_paths_.empty()) {
+            int padded_h = target_height_ + 2 * crop_pad_;
+            int padded_w = target_width_  + 2 * crop_pad_;
+            cache_.resize(image_paths_.size() * static_cast<size_t>(padded_h) * padded_w * 3);
+            std::cout << "Caching " << image_paths_.size() << " images (" << (cache_.size() / (1024 * 1024)) << " MB)...\n" << std::flush;
+            for (size_t i = 0; i < image_paths_.size(); ++i) {
+                int w, h, channels;
+                unsigned char* data = stbi_load(image_paths_[i].c_str(), &w, &h, &channels, 3);
+                if (!data) throw std::runtime_error("Failed to load image: " + image_paths_[i]);
+                resize_rgb_bilinear(data, w, h,
+                                    cache_.data() + i * static_cast<size_t>(padded_h) * padded_w * 3,
+                                    padded_w, padded_h);
+                stbi_image_free(data);
+            }
+            has_cache_ = true;
+        }
     }
     
     size_t size() const override { return image_paths_.size(); }
@@ -130,18 +193,28 @@ public:
     void set_train_mode(bool mode) const override { train_mode_ = mode; }
 
     std::pair<Tensor<T>, Tensor<T>> get(size_t index) const override {
-        // Load image using stb_image
-        int w, h, channels;
-        unsigned char* data = stbi_load(image_paths_[index].c_str(), &w, &h, &channels, 3);
-        
-        if (!data) {
-            throw std::runtime_error("Failed to load image: " + image_paths_[index]);
-        }
-
         // Padded size: resize to (target + crop_pad) then crop to target.
         // This gives random crops in train mode and center crops in eval mode.
         int padded_h = target_height_ + 2 * crop_pad_;
         int padded_w = target_width_  + 2 * crop_pad_;
+
+        // Source pixels: from the one-time RAM cache when available, otherwise
+        // load the JPEG and resize into a local buffer on the fly.
+        std::vector<unsigned char> local_padded;
+        const unsigned char* padded = nullptr;
+        if (has_cache_) {
+            padded = cache_.data() + index * (size_t(padded_h) * padded_w * 3);
+        } else {
+            int w, h, channels;
+            unsigned char* data = stbi_load(image_paths_[index].c_str(), &w, &h, &channels, 3);
+            if (!data) {
+                throw std::runtime_error("Failed to load image: " + image_paths_[index]);
+            }
+            local_padded.resize(static_cast<size_t>(padded_h) * padded_w * 3);
+            resize_rgb_bilinear(data, w, h, local_padded.data(), padded_w, padded_h);
+            stbi_image_free(data);
+            padded = local_padded.data();
+        }
 
         // Determine crop offset within the padded image
         int crop_x, crop_y;
@@ -161,49 +234,52 @@ public:
             do_flip = flip_dist(rng_);
         }
 
+        // Color jitter factors (train only): brightness, contrast, saturation
+        float bf = 1.0f, cf = 1.0f, sf = 1.0f;
+        if (train_mode_) {
+            std::uniform_real_distribution<float> b_dist(0.8f, 1.2f);
+            std::uniform_real_distribution<float> c_dist(0.8f, 1.2f);
+            std::uniform_real_distribution<float> s_dist(0.8f, 1.2f);
+            bf = b_dist(rng_); cf = c_dist(rng_); sf = s_dist(rng_);
+        }
+
         // Create output tensor [1, 3, target_h, target_w]
-        Tensor<T> image({size_t(1), size_t(3), 
-                          static_cast<size_t>(target_height_), 
+        Tensor<T> image({size_t(1), size_t(3),
+                          static_cast<size_t>(target_height_),
                           static_cast<size_t>(target_width_)});
         T* out = image.data();
-        
-        // Resize source image to padded size, then crop to target.
-        // We fuse resize + crop + flip + normalize in a single pass:
-        //   for each output pixel (y, x):
-        //     map to padded coords (y + crop_y, x + crop_x), flipping x if needed
-        //     bilinear-interpolate from the original image
-        //     normalize
-        float x_ratio = static_cast<float>(w) / padded_w;
-        float y_ratio = static_cast<float>(h) / padded_h;
-        
+
+        // Crop + flip + jitter + normalize in a single pass. The padded buffer
+        // is already at target resolution, so pixels are read directly (no
+        // interpolation needed here):
         for (int y = 0; y < target_height_; ++y) {
             for (int x = 0; x < target_width_; ++x) {
                 // Map output pixel to padded-image coordinates
                 int px = do_flip ? (target_width_ - 1 - x + crop_x) : (x + crop_x);
                 int py = y + crop_y;
 
-                float src_x = px * x_ratio;
-                float src_y = py * y_ratio;
-                
-                int x0 = static_cast<int>(src_x);
-                int y0 = static_cast<int>(src_y);
-                int x1 = std::min(x0 + 1, w - 1);
-                int y1 = std::min(y0 + 1, h - 1);
-                
-                float x_frac = src_x - x0;
-                float y_frac = src_y - y0;
-                
+                float r = padded[(py * padded_w + px) * 3 + 0];
+                float g = padded[(py * padded_w + px) * 3 + 1];
+                float b = padded[(py * padded_w + px) * 3 + 2];
+
+                // Color jitter (train only): brightness, then contrast, then
+                // saturation using the luminance of the jittered pixel.
+                if (train_mode_) {
+                    r *= bf; g *= bf; b *= bf;
+                    r = (r - 128.0f) * cf + 128.0f;
+                    g = (g - 128.0f) * cf + 128.0f;
+                    b = (b - 128.0f) * cf + 128.0f;
+                    float lum = 0.299f * r + 0.587f * g + 0.114f * b;
+                    r = lum + sf * (r - lum);
+                    g = lum + sf * (g - lum);
+                    b = lum + sf * (b - lum);
+                    r = std::max(0.0f, std::min(255.0f, r));
+                    g = std::max(0.0f, std::min(255.0f, g));
+                    b = std::max(0.0f, std::min(255.0f, b));
+                }
+
                 for (int c = 0; c < 3; ++c) {
-                    float v00 = data[(y0 * w + x0) * 3 + c];
-                    float v01 = data[(y0 * w + x1) * 3 + c];
-                    float v10 = data[(y1 * w + x0) * 3 + c];
-                    float v11 = data[(y1 * w + x1) * 3 + c];
-                    
-                    float v = v00 * (1 - x_frac) * (1 - y_frac) +
-                              v01 * x_frac * (1 - y_frac) +
-                              v10 * (1 - x_frac) * y_frac +
-                              v11 * x_frac * y_frac;
-                    
+                    float v = (c == 0) ? r : ((c == 1) ? g : b);
                     T out_val;
                     if (normalize_) {
                         // ImageNet normalization: (v/255 - mean) / std
@@ -215,11 +291,28 @@ public:
                 }
             }
         }
-        
-        // Channels are already in order: R, G, B (stb_image loads as RGB)
-        // No need to swap - the tensor layout is [C, H, W]
-        
-        stbi_image_free(data);
+
+        // Random erasing (train only): zero out a random rectangle
+        if (train_mode_) {
+            std::bernoulli_distribution erase_dist(0.5);
+            if (erase_dist(rng_)) {
+                // Random rectangle, area 2-15% of image, aspect 0.3-3.3, filled with 0.
+                std::uniform_real_distribution<float> area_dist(0.02f, 0.15f);
+                std::uniform_real_distribution<float> aspect_dist(0.3f, 3.3f);
+                float area = area_dist(rng_) * (target_height_ * target_width_);
+                float aspect = aspect_dist(rng_);
+                int eh = std::min(target_height_, std::max(1, static_cast<int>(std::round(std::sqrt(area * aspect)))));
+                int ew = std::min(target_width_,  std::max(1, static_cast<int>(std::round(std::sqrt(area / aspect)))));
+                std::uniform_int_distribution<int> hy_dist(0, target_height_ - eh);
+                std::uniform_int_distribution<int> wx_dist(0, target_width_ - ew);
+                int hy = hy_dist(rng_);
+                int wx = wx_dist(rng_);
+                for (int y = hy; y < hy + eh; ++y)
+                    for (int x = wx; x < wx + ew; ++x)
+                        for (int c = 0; c < 3; ++c)
+                            out[c * target_height_ * target_width_ + y * target_width_ + x] = T(0);
+            }
+        }
         
         // Create one-hot label tensor
         Tensor<T> label({1, static_cast<size_t>(class_to_idx_.size())});
@@ -349,6 +442,7 @@ public:
     size_t fc_in_features_;
     Linear<T> fc_;
     AdaptiveAvgPool2D<T> avg_pool_;
+    Dropout<T> dropout_{T(0.5)};
     
     ResNet10(int num_classes = 100, Device device = {})
         : conv1_(3, 64, 7, 2, 3, true, device),  // 84x84 -> 42x42
@@ -391,6 +485,9 @@ public:
         
         // Flatten: [N, 256, 1, 1] -> [N, 256]
         out = flatten(out);
+        
+        // Dropout on the 256-dim features before the FC head (p=0.5, train only)
+        out = dropout_.forward(out);
         
         // FC: [N, 256] -> [N, num_classes]
         out = fc_.forward(out);
@@ -443,6 +540,7 @@ public:
         layer2_block2_.train();
         layer3_block1_.train();
         layer3_block2_.train();
+        dropout_.train();
     }
     
     void eval() {
@@ -454,6 +552,7 @@ public:
         layer2_block2_.eval();
         layer3_block1_.eval();
         layer3_block2_.eval();
+        dropout_.eval();
     }
 };
 
@@ -655,31 +754,36 @@ train_val_split(Dataset<T>& dataset, double val_ratio = 0.1, unsigned int seed =
 // ============================================================================
 
 int main() {
+    setvbuf(stdout, nullptr, _IOLBF, BUFSIZ);
+    std::cout << std::unitbuf;
+    
     using T = float;
     
     std::cout << "=== ResNet10 Training on miniImageNet ===" << std::endl;
     
     // Load dataset
-    std::cout << "\n[1] Loading miniImageNet dataset..." << std::endl;
+    fmt::print("\n[1] Loading miniImageNet dataset...\n");
     MiniImageNetDataset<T> full_dataset("data/miniImagenet", 84, true);
     
     int num_classes = full_dataset.num_classes();
-    std::cout << "Number of classes: " << num_classes << std::endl;
+    fmt::print("Number of classes: {}\n", num_classes);
     
     // Split into train/val
+    fmt::print("\n[2] Splitting into train/val...\n");
     auto [train_ds, val_ds] = train_val_split(full_dataset, 0.1, 42);
-    std::cout << "Train samples: " << train_ds->size() << std::endl;
-    std::cout << "Val samples: " << val_ds->size() << std::endl;
+    fmt::print("Train samples: {}\n", train_ds->size());
+    fmt::print("Val samples: {}\n", val_ds->size());
     
     // Create data loaders
     const size_t batch_size = 128;
     DataLoader<T> train_loader(*train_ds, batch_size, true);
     DataLoader<T> val_loader(*val_ds, batch_size, false);
     
-    std::cout << std::format("Train batches: {}\n", (train_ds->size() + batch_size - 1) / batch_size);
+    fmt::print("Train batches: {}\n", (train_ds->size() + batch_size - 1) / batch_size);
+    fmt::print("Val batches: {}\n", (val_ds->size() + batch_size - 1) / batch_size);
 
     // Create model
-    std::cout << "\n[2] Creating ResNet10 model..." << std::endl;
+    fmt::print("\n[2] Creating ResNet10 model...\n");
     auto model = std::make_shared<ResNet10<T>>(num_classes);
     
     Device gpu(DeviceType::CUDA);
@@ -691,23 +795,33 @@ int main() {
     for (const auto& p : params) {
         num_params += p.total_elements();
     }
-    std::cout << "Model parameters: " << num_params << std::endl;
-    
-    // Optimizer — SGD with momentum, weight decay, and gradient clipping.
-    // clip_norm=1.0 prevents grad explosions from lr=0.01 + momentum=0.9.
-    // The device-resident LR (lr_device_) makes scheduler changes visible
-    // inside the captured CUDA/HIP graph.
+
+    fmt::print("Model parameters: {}\n", num_params);
+    // Optimizer — SGD with momentum and weight decay.
+    // base_lr 0.01 (stable after warmup; diagnosed earlier that LR > 0.015 diverges).
+    // Gradient clipping at 10.0 catches rare spikes (steady-state grad norm ~1-10).
+    // weight_decay 1e-3 (up from 5e-4) + Dropout(0.5) on the 256-dim features before
+    // the FC head, because the model (2.81M params, 54K train images) overfits hard:
+    // previous run reached train_loss ~0.01 vs val_loss ~1.6 with val acc plateauing ~60%.
+    //
+    // NOTE: this run is deliberately EAGER (no graph capture) — see the loop comment
+    // below. Dropout's CPU-side mask (std::mt19937 in Dropout::forward) would be baked
+    // into a captured graph and replayed with a FIXED mask every batch, which is wrong;
+    // a graph-safe Dropout needs a GPU-side RNG kernel (library change).
+    //
+    // 400 epochs total (down from 1000): the previous run gained almost nothing from
+    // epochs 30-500 at lr ~0.01 (val loss stuck ~1.9-2.1 while train loss fell to 0.1)
+    // and only improved once cosine decayed LR below ~0.005. 20-epoch warmup, then
+    // cosine from 0.01 to 1e-5 over the remaining 380 epochs.
     const T base_lr = T(0.01);
-    const int epochs = 1000;
-    const int warmup_epochs = 10;
-    SGD<T> optimizer(model->parameters(), base_lr, T(0.0001), 0.9, T(5.0));
+    const int epochs = 400;
+    const int warmup_epochs = 20;
+    SGD<T> optimizer(model->parameters(), base_lr, T(0.001), 0.9, T(10.0));
     // AdamW<T> optimizer(model->parameters(), T(0.001), T(0.9), T(0.999), T(1e-8), T(0.01));
-    
-    GraphExecutor<T> executor(model, optimizer, cross_entropy<T>);
     
     // Cosine annealing scheduler — T_max accounts for warmup epochs.
     // Warmup epochs use a linear LR ramp; cosine takes over afterward.
-    CosineAnnealingLR<T> scheduler(optimizer, epochs - warmup_epochs, T(1e-6));
+    CosineAnnealingLR<T> scheduler(optimizer, epochs - warmup_epochs, T(1e-5));
     
     T best_val_acc = T(0);
     std::string best_weights_path = "best_resnet10.bin";
@@ -733,7 +847,7 @@ int main() {
         std::ifstream f(CHECKPOINT_PATH);
         if (f.good()) {
             f.close();
-            std::cout << "\nCheckpoint found! Loading for resumption..." << std::endl;
+            fmt::print("\nCheckpoint found! Loading for resumption...\n");
             auto model_params = model->parameters();
             auto opt_buf = optimizer.state_buffers();
             auto opt_scalars = optimizer.state_scalars();
@@ -751,14 +865,12 @@ int main() {
             if (load_checkpoint_meta(CHECKPOINT_META_PATH, meta_epoch, meta_best)) {
                 start_epoch = meta_epoch + 1;
                 if (meta_best > best_val_acc) best_val_acc = meta_best;
-                std::cout << "Resuming from epoch " << start_epoch + 1 << "/" << epochs
-                          << " (best val acc: " << (best_val_acc * 100) << "%)" << std::endl;
+                fmt::print("Resuming from epoch {} of {} (best val acc: {:.2f}%)\n", start_epoch + 1, epochs, (best_val_acc * 100));
             }
         }
     }
     
-    std::cout << "\n[3] Training for " << epochs << " epochs..." << std::endl;
-    std::cout << std::fixed << std::setprecision(4);
+    fmt::print("\n[3] Training for {} epochs...\n", epochs);
     
     // GPU-resident loss accumulator (avoids per-batch D2H sync)
     Tensor<T> loss_accum({1}, gpu);
@@ -784,13 +896,25 @@ int main() {
         size_t train_batches = 0;
         
         for (auto [bx, by] : train_loader) {
-            // Skip partial last batch — graph capture requires fixed shape
+            // Skip partial last batch — training loop assumes fixed batch size
             if (bx.shape()[0] != batch_size) break;
             
             auto bx_gpu = bx.to(gpu);
             auto by_gpu = by.to(gpu);
             
-            auto loss = executor.step(bx_gpu, by_gpu);
+            // Deliberately EAGER: no graph capture for this run.
+            // Dropout's CPU-side mask (std::mt19937 in Dropout::forward) would be baked
+            // into a captured graph and replayed with a FIXED mask every batch — wrong;
+            // a graph-safe Dropout needs a GPU-side RNG kernel (library change).
+            // BatchNorm running stats ARE graph-safe now (device kernels folded outside
+            // the captured graph, see BatchNorm2d::fold_running_stats in Module.hpp),
+            // so a dropout-free graph-mode run would work.
+            model->train();
+            optimizer.zero_grad();
+            auto preds = model->forward(bx_gpu);
+            auto loss = cross_entropy(preds, by_gpu);
+            loss.backward();
+            optimizer.step();
 
             // Accumulate loss on GPU (no D2H sync per batch)
             add_(loss_accum, loss);
@@ -834,21 +958,21 @@ int main() {
         
         auto epoch_end = std::chrono::high_resolution_clock::now();
         double epoch_sec = std::chrono::duration<double>(epoch_end - epoch_start).count();
-        
-        std::cout << "Epoch " << std::setw(2) << epoch + 1 << "/" << epochs
-                  << " | lr: " << std::setprecision(6) << optimizer.lr()
-                  << " | train_loss: " << std::setprecision(4) << avg_train_loss
-                  << " | val_loss: " << avg_val_loss
-                  << " | val_acc: " << std::setprecision(2) << (avg_val_acc * 100) << "%"
-                  << " | time: " << std::setprecision(1) << epoch_sec << "s";
+        fmt::print("Epoch {} of {} | lr: {:.6f} | train_loss: {:.4f} | val_loss: {:.4f} | val_acc: {:.2f}% | time: {:.1f}s", epoch + 1, epochs, optimizer.lr(), avg_train_loss, avg_val_loss, (avg_val_acc * 100), epoch_sec);
+        // std::cout << "Epoch " << std::setw(2) << epoch + 1 << "/" << epochs
+        //           << " | lr: " << std::setprecision(6) << optimizer.lr()
+        //           << " | train_loss: " << std::setprecision(4) << avg_train_loss
+        //           << " | val_loss: " << avg_val_loss
+        //           << " | val_acc: " << std::setprecision(2) << (avg_val_acc * 100) << "%"
+        //           << " | time: " << std::setprecision(1) << epoch_sec << "s";
         
         // Save best weights
         if (avg_val_acc > best_val_acc) {
             best_val_acc = avg_val_acc;
             model->save(best_weights_path);
-            std::cout << " [BEST]";
+            fmt::print(" [BEST]");
         }
-        std::cout << std::endl;
+        fmt::print("\n");
         
         // Save checkpoint for training resumption
         save_checkpoint_now(epoch);
@@ -861,30 +985,30 @@ int main() {
         
         // Graceful shutdown on SIGINT/SIGTERM (catch interrupts during validation)
         if (g_interrupted) {
-            std::cout << "\nInterrupted! Checkpoint saved. Exiting." << std::endl;
+            fmt::print("\nInterrupted! Checkpoint saved. Exiting.\n");
             save_checkpoint_now(epoch);
             return 0;
         }
     }
     
     // Load best weights
-    std::cout << "\n[4] Loading best weights..." << std::endl;
+    fmt::print("\n[4] Loading best weights...\n");
     model->load(best_weights_path);
-    std::cout << "Best validation accuracy: " << (best_val_acc * 100) << "%" << std::endl;
+    fmt::print("Best validation accuracy: {:.2f}%\n", (best_val_acc * 100));
     
     // Save final model
-    std::cout << "\n[5] Saving model..." << std::endl;
+    fmt::print("\n[5] Saving model...\n");
     model->save("resnet10_final.bin");
-    std::cout << "Saved final weights to resnet10_final.bin" << std::endl;
+    fmt::print("Saved final weights to resnet10_final.bin\n");
     
     // Export graph structure
     model->export_onnx("resnet10.graph");
-    std::cout << "Saved graph structure to resnet10.graph" << std::endl;
-    
+    fmt::print("Saved graph structure to resnet10.graph\n");
+
     // Export ONNX (simplified format)
     export_onnx("resnet10.onnx.txt", *model, {1, 3, 84, 84});
     
-    std::cout << "\n=== Training Complete ===" << std::endl;
+    fmt::print("\n=== Training Complete ===\n");
     
     return 0;
 }

@@ -507,8 +507,74 @@ struct Conv2DBackward : public AutogradNode<T> {
         }
     }
 
-    std::vector<Tensor<T>> get_inputs() const override { 
-        return {saved_input.unpack(), saved_weight.unpack(), saved_bias.unpack()}; 
+    std::vector<Tensor<T>> get_inputs() const override {
+        return {saved_input.unpack(), saved_weight.unpack(), saved_bias.unpack()};
+    }
+};
+
+// ---------------------------------------------------------------
+// Batch Normalization Backward Node (GPU full gradient)
+// ---------------------------------------------------------------
+// Computes the complete BN backward including the correction terms
+// from mean and variance that are lost when bn_fwd_gpu bypasses
+// autograd.  The full formula is:
+//
+//   inv_std  = 1 / sqrt(var + eps)
+//   x_hat    = (x - mean) * inv_std
+//   dx_hat   = grad_output * gamma
+//   mean_dx  = mean(dx_hat)  over (N, H, W)
+//   mean_dxx = mean(dx_hat * x_hat)  over (N, H, W)
+//   dx       = inv_std * (dx_hat - mean_dx - x_hat * mean_dxx)
+//   dgamma   = sum(dx_hat * x_hat)  over (N, H, W)
+//   dbeta    = sum(dx_hat)  over (N, H, W)
+//
+// Without the -mean_dx - x_hat*mean_dxx terms the gradient is biased
+// and convergence degrades significantly on deeper networks.
+
+template<typename T>
+struct BatchNormBackward : public AutogradNode<T> {
+    SavedTensor<T> saved_input;
+    SavedTensor<T> saved_mean;
+    SavedTensor<T> saved_var;
+    SavedTensor<T> saved_gamma;
+    SavedTensor<T> saved_beta;
+    T eps;
+
+    BatchNormBackward(Tensor<T> input, Tensor<T> mean, Tensor<T> var,
+                      Tensor<T> gamma, Tensor<T> beta, T eps)
+        : saved_input(input), saved_mean(mean), saved_var(var),
+          saved_gamma(gamma), saved_beta(beta), eps(eps) {}
+
+    std::vector<Tensor<T>> get_inputs() const override {
+        return {saved_input.unpack(), saved_gamma.unpack(), saved_beta.unpack()};
+    }
+
+    void apply(const Tensor<T>& grad_output) override {
+        NoGradGuard guard;
+
+        Tensor<T> x      = saved_input.unpack();
+        Tensor<T> mean   = saved_mean.unpack();
+        Tensor<T> var    = saved_var.unpack();
+        Tensor<T> gamma  = saved_gamma.unpack();
+        Tensor<T> beta   = saved_beta.unpack();
+
+        bool need_x     = x.requires_grad();
+        bool need_gamma = gamma.requires_grad();
+        bool need_beta  = beta.requires_grad();
+        if (!need_x && !need_gamma && !need_beta) return;
+
+        // Allocate output tensors
+        Tensor<T> grad_x(x.shape(), x.device());
+        Tensor<T> grad_gamma(gamma.shape(), gamma.device());
+        Tensor<T> grad_beta(beta.shape(), beta.device());
+
+        // Single GPU kernel call computes all three gradients
+        bn_bwd_gpu(grad_output, x, mean, var, gamma, eps,
+                   grad_x, grad_gamma, grad_beta);
+
+        if (need_x)     x.accumulate_grad(grad_x);
+        if (need_gamma) gamma.accumulate_grad(grad_gamma);
+        if (need_beta)  beta.accumulate_grad(grad_beta);
     }
 };
 

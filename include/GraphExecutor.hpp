@@ -99,21 +99,13 @@ public:
             (void)hipDeviceSynchronize();
 #endif
             capture_graph();
-            // Device sync after capture: cudaStreamEndCapture removes the captured
-            // operations from the stream, so syncing the stream returns immediately.
-            // The captured GPU work (forward/backward/step) may still be in-flight
-            // on the device — a device-wide sync ensures static_loss_'s data and all
-            // parameter/velocity updates are visible before the caller reads them.
-#if defined(USE_CUDA)
-            (void)cudaDeviceSynchronize();
-#elif defined(USE_ROCM)
-            (void)hipDeviceSynchronize();
-#endif
             state_ = State::GRAPH_READY;
-            // Don't replay here — capture_graph() already executed the full
-            // forward→backward→step. Replaying would double-apply the step,
-            // overfitting params to this batch and exploding loss on the next.
-            return static_loss_;
+            // Stream capture only RECORDS work — nothing executes during capture
+            // (CUDA/HIP semantics), so static_loss_ is uninitialized and this
+            // batch's optimizer step was never applied. Run the graph once to
+            // actually execute it: replay() launches, syncs, folds BN running
+            // stats, and returns the real loss.
+            return replay(x, y);
         }
 
         return replay(x, y);
@@ -207,6 +199,12 @@ private:
         GPU_CHECK(hipGraphLaunch(graph_exec_, capture_stream_));
         (void)hipStreamSynchronize(capture_stream_);
 #endif
+
+        // BatchNorm running stats are folded with plain device kernels after
+        // the replay (in-graph in-place writes to pre-existing memory are
+        // unreliable on HIP — ROCm/hip#3887 family). The stream sync above
+        // makes the replayed batch stats visible to the fold.
+        BatchNorm2d<T>::fold_all();
 
         model_->train();
         return static_loss_;

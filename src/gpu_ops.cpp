@@ -1481,6 +1481,182 @@ void bn_relu_fwd_gpu(
     GPU_CHECK(get_last_error_capture_safe());
 }
 
+// #######################################################
+// #   Batch Normalization Backward (full gradient)
+// #######################################################
+// Kernel 1: per-channel reduction over (N, H, W) to compute
+//   sum_dy   = Σ(dL/dy)           — used for dβ and mean_dy
+//   sum_dy_x = Σ(dL/dy * x̂)       — used for dγ and mean_dy_x
+//
+// One block per channel; tree reduction in shared memory.
+template<typename T>
+__global__ void bn_bwd_stats_kernel(
+    const T* __restrict__ dy,
+    const T* __restrict__ x,
+    const T* __restrict__ mean,
+    const T* __restrict__ var,
+    const T* __restrict__ gamma,
+    T eps,
+    T* __restrict__ sum_dy,      // [C] output
+    T* __restrict__ sum_dy_x,    // [C] output
+    int N, int C, int H, int W
+) {
+    int c = blockIdx.x;
+    if (c >= C) return;
+
+    int tid = threadIdx.x;
+    int tile = blockDim.x;
+    int total = N * H * W;
+
+    T inv_std = T(1) / sqrt(var[c] + eps);
+    T mean_c  = mean[c];
+    T gamma_c = gamma[c];
+
+    T local_sum_dy   = T(0);
+    T local_sum_dy_x = T(0);
+
+    int chw = C * H * W;
+    int hw  = H * W;
+
+    for (int i = tid; i < total; i += tile) {
+        int n      = i / hw;
+        int hw_rem = i % hw;
+        int h      = hw_rem / W;
+        int w      = hw_rem % W;
+
+        int idx = n * chw + c * hw + h * W + w;
+        T x_val = x[idx];
+        T dy_val = dy[idx];
+        T x_hat = (x_val - mean_c) * inv_std;
+
+        local_sum_dy   += dy_val;
+        local_sum_dy_x += dy_val * x_hat;
+    }
+
+    // Shared-memory tree reduction
+    extern __shared__ __align__(sizeof(T)) unsigned char smem_buf[];
+    T* smem     = reinterpret_cast<T*>(smem_buf);
+    T* s_sum    = smem;
+    T* s_sum_x  = smem + tile;
+
+    s_sum[tid]   = local_sum_dy;
+    s_sum_x[tid] = local_sum_dy_x;
+    __syncthreads();
+
+    for (int s = tile >> 1; s > 0; s >>= 1) {
+        if (tid < s) {
+            s_sum[tid]   += s_sum[tid + s];
+            s_sum_x[tid] += s_sum_x[tid + s];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        sum_dy[c]   = s_sum[0];
+        sum_dy_x[c] = s_sum_x[0];
+    }
+}
+
+// Kernel 2: element-wise dL/dx with the full BN correction terms.
+//   dx = inv_std * γ * (dy - mean_dy - x̂ * mean_dy_x)
+//
+// All per-channel statistics come from the stats kernel outputs
+// stored in the same tensors as dγ and dβ.
+template<typename T>
+__global__ void bn_bwd_kernel(
+    const T* __restrict__ dy,
+    const T* __restrict__ x,
+    const T* __restrict__ mean,
+    const T* __restrict__ var,
+    const T* __restrict__ gamma,
+    const T* __restrict__ sum_dy,      // precomputed Σ(dy)   per channel
+    const T* __restrict__ sum_dy_x,    // precomputed Σ(dy·x̂) per channel
+    T eps,
+    T* __restrict__ dx,
+    int N, int C, int H, int W,
+    T inv_nhw
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = N * C * H * W;
+    if (idx >= total) return;
+
+    int hw = H * W;
+    int c  = (idx / hw) % C;
+
+    T inv_std  = T(1) / sqrt(var[c] + eps);
+    T mean_c   = mean[c];
+    T gamma_c  = gamma[c];
+
+    T x_val  = x[idx];
+    T dy_val = dy[idx];
+    T x_hat  = (x_val - mean_c) * inv_std;
+    T dx_hat = dy_val * gamma_c;
+
+    // Per-channel means over (N, H, W)
+    T mean_dy   = sum_dy[c]   * inv_nhw;
+    T mean_dy_x = sum_dy_x[c] * inv_nhw;
+
+    // Full BN backward: dx = inv_std * γ * (dy - mean_dy - x̂ * mean_dy_x)
+    // Equivalently:       dx = inv_std * (dx_hat - γ·mean_dy - γ·x̂·mean_dy_x)
+    dx[idx] = inv_std * (dx_hat - mean_dy * gamma_c - x_hat * mean_dy_x * gamma_c);
+}
+
+// Launcher: wraps the two kernels; writes directly to grad_gamma/dβ/dx.
+// The stats kernel writes Σ(dy) → grad_beta and Σ(dy·x̂) → grad_gamma,
+// then the element-wise kernel reads those same buffers for dx.
+template<typename T>
+void bn_bwd_gpu(
+    const Tensor<T>& grad_output,
+    const Tensor<T>& input,
+    const Tensor<T>& mean,
+    const Tensor<T>& var,
+    const Tensor<T>& gamma,
+    T eps,
+    Tensor<T>& grad_input,
+    Tensor<T>& grad_gamma,
+    Tensor<T>& grad_beta
+) {
+    int N = (int)input.shape()[0];
+    int C = (int)input.shape()[1];
+    int H = (int)input.shape()[2];
+    int W = (int)input.shape()[3];
+    T NHW = T(N * H * W);
+
+    int threads = 256;
+
+    // ── Kernel 1: per-channel reduction ──
+    // Writes Σ(dy) → grad_beta, Σ(dy·x̂) → grad_gamma.
+    {
+        size_t smem_bytes = 2 * threads * sizeof(T);
+        bn_bwd_stats_kernel<T><<<(uint32_t)C, threads, smem_bytes, active_stream()>>>(
+            grad_output.data(), input.data(),
+            mean.data(), var.data(), gamma.data(), eps,
+            grad_beta.data(),   // ← Σ(dy)   = dβ
+            grad_gamma.data(),  // ← Σ(dy·x̂) = dγ
+            N, C, H, W
+        );
+        GPU_CHECK(get_last_error_capture_safe());
+    }
+
+    // ── Kernel 2: element-wise dx ──
+    {
+        int total = N * C * H * W;
+        int blocks = (total + threads - 1) / threads;
+        if (blocks == 0) blocks = 1;
+
+        bn_bwd_kernel<T><<<blocks, threads, 0, active_stream()>>>(
+            grad_output.data(), input.data(),
+            mean.data(), var.data(), gamma.data(),
+            grad_beta.data(),   // Σ(dy)
+            grad_gamma.data(),  // Σ(dy·x̂)
+            eps,
+            grad_input.data(),
+            N, C, H, W, T(1) / NHW
+        );
+        GPU_CHECK(get_last_error_capture_safe());
+    }
+}
+
 template<typename T>
 __global__ void mat_transpose_kernel(
     const T *x, T *y, int row, int col
@@ -3407,6 +3583,7 @@ template Tensor<float> sum_gpu<float>(const Tensor<float>&, size_t, bool);
 template void add_relu_gpu<float>(const Tensor<float>&, const Tensor<float>&, Tensor<float>&);
 template void bn_fwd_gpu<float>(const Tensor<float>&, Tensor<float>&, Tensor<float>&);
 template void bn_relu_fwd_gpu<float>(const Tensor<float>&, Tensor<float>&, const Tensor<float>&, const Tensor<float>&, const Tensor<float>&, const Tensor<float>&, float);
+template void bn_bwd_gpu<float>(const Tensor<float>&, const Tensor<float>&, const Tensor<float>&, const Tensor<float>&, const Tensor<float>&, float, Tensor<float>&, Tensor<float>&, Tensor<float>&);
 
 template void conv2d_gpu<float>(Tensor<float> const&, Tensor<float> const&, Tensor<float> const&, Tensor<float>&, unsigned long, unsigned long);
 template void conv2d_gpu_strided<float>(Tensor<float> const&, Tensor<float> const&, Tensor<float> const&, Tensor<float>&, unsigned long, unsigned long);
