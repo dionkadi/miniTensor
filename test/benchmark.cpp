@@ -512,20 +512,20 @@ static void bench_cross_entropy(int B, int C) {
         auto r = run_bench("cross_entropy_fwd",
                            std::to_string(B) + "x" + std::to_string(C),
                            5, 20,
-                           [&]() { cross_entropy_fwd_gpu<float>(logits, targets); },
+                           [&]() { cross_entropy_fwd_gpu<float>(logits, targets, 0.0f); },
                            bytes, 0);
         print_result(r);
     }
 
     // Backward
     {
-        auto loss = cross_entropy_fwd_gpu<float>(logits, targets);
+        auto loss = cross_entropy_fwd_gpu<float>(logits, targets, 0.0f);
         auto grad_logits = make_gpu_tensor({static_cast<size_t>(B), static_cast<size_t>(C)});
 
         auto r = run_bench("cross_entropy_bwd",
                            std::to_string(B) + "x" + std::to_string(C),
                            5, 20,
-                           [&]() { cross_entropy_bwd_gpu<float>(loss, logits, targets, grad_logits); },
+                           [&]() { cross_entropy_bwd_gpu<float>(loss, logits, targets, grad_logits, 0.0f); },
                            bytes, 0);
         print_result(r);
     }

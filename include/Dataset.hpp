@@ -77,11 +77,20 @@ class ThreadSafeQueue {
     mutable std::mutex mtx_;
     std::condition_variable cv_;
     bool done_ = false;
+    size_t capacity_;  // 0 = unbounded
 public:
-    void push(T item) {
-        std::lock_guard<std::mutex> lock(mtx_);
+    explicit ThreadSafeQueue(size_t capacity = 0) : capacity_(capacity) {}
+
+    // Bounded push: blocks while the queue is full so a producer never runs
+    // arbitrarily far ahead of the consumer. Returns false if the queue was
+    // shut down (done) while waiting.
+    bool push(T item) {
+        std::unique_lock<std::mutex> lock(mtx_);
+        cv_.wait(lock, [this] { return capacity_ == 0 || q_.size() < capacity_ || done_; });
+        if (done_) return false;
         q_.push(std::move(item));
         cv_.notify_one();
+        return true;
     }
 
     bool pop(T& item) {
@@ -90,6 +99,7 @@ public:
         if (q_.empty()) return false;
         item = std::move(q_.front());
         q_.pop();
+        cv_.notify_one();  // wake a blocked producer
         return true;
     }
 
@@ -97,6 +107,14 @@ public:
         std::lock_guard<std::mutex> lock(mtx_);
         done_ = true;
         cv_.notify_all();
+    }
+
+    // Drop all queued items and clear the done flag. Only safe after the
+    // producer has been joined (no other thread touching the queue).
+    void reset() {
+        std::lock_guard<std::mutex> lock(mtx_);
+        while (!q_.empty()) q_.pop();
+        done_ = false;
     }
 
     bool empty() const {
@@ -115,7 +133,6 @@ class AsyncDataLoader {
     ThreadSafeQueue<std::pair<Tensor<T>, Tensor<T>>> queue_;
     std::thread worker_;
     std::atomic<bool> running_{false};
-    size_t prefetch_count_;
 
     void prefetch_worker() {
         while (running_ && current_idx_ < indices_.size()) {
@@ -125,7 +142,9 @@ class AsyncDataLoader {
                 batch_items.push_back(dataset_.get(indices_[i]));
             }
             current_idx_ = end_idx;
-            queue_.push(default_collate(batch_items));
+            // Bounded push: blocks while the queue is full; returns false
+            // when the loader is being shut down (stop/epoch restart).
+            if (!queue_.push(default_collate(batch_items))) break;
         }
         queue_.done();
     }
@@ -134,7 +153,7 @@ public:
     AsyncDataLoader(const Dataset<T>& dataset, size_t batch_size,
                     bool shuffle = true, size_t prefetch = 2)
         : dataset_(dataset), batch_size_(batch_size),
-          shuffle_(shuffle), prefetch_count_(prefetch) {
+          shuffle_(shuffle), queue_(prefetch) {
         indices_.resize(dataset_.size());
         std::iota(indices_.begin(), indices_.end(), 0);
     }
@@ -173,6 +192,12 @@ public:
     };
 
     Iterator begin() {
+        // Restart-safe: a range-for runs begin() once per epoch, so join any
+        // worker from the previous epoch and discard stale queued batches
+        // before spawning the new prefetch thread. Without this, the second
+        // begin() destroys a joinable std::thread (std::terminate).
+        stop();
+        queue_.reset();
         if (shuffle_) {
             std::mt19937 g(std::random_device{}());
             std::shuffle(indices_.begin(), indices_.end(), g);

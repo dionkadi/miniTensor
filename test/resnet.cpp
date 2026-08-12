@@ -1,4 +1,4 @@
-// ResNet10 training on miniImageNet
+// ResNet50 training on miniImageNet (Bottleneck blocks, label smoothing)
 // Tests: BatchNorm2d, Dropout, LayerNorm, Functional API, Skip connections,
 //        Model serialization, ONNX-like graph export, Async DataLoader
 
@@ -104,7 +104,7 @@ private:
     static constexpr float imagenet_std[3]  = {0.229f, 0.224f, 0.225f};
 
     // Padding (pixels) added around the target size for random cropping.
-    static constexpr int crop_pad_ = 8;
+    static constexpr int crop_pad_ = 12;
 
 public:
     MiniImageNetDataset(const std::string& root_dir, int target_size = 84,
@@ -166,8 +166,8 @@ public:
         std::cout << "Total images: " << image_paths_.size() << std::endl;
 
         // One-time RAM cache: every image resized to padded (target + crop pad)
-        // resolution as uint8 RGB. For target 84 + pad 8 this is 60K x 100 x 100
-        // x 3 bytes ≈ 1.8 GB; the build takes a few minutes.
+        // resolution as uint8 RGB. For target 84 + pad 12 this is 60K x 108 x 108
+        // x 3 bytes ≈ 2.1 GB; the build takes a few minutes.
         if (cache_images_ && !image_paths_.empty()) {
             int padded_h = target_height_ + 2 * crop_pad_;
             int padded_w = target_width_  + 2 * crop_pad_;
@@ -234,12 +234,13 @@ public:
             do_flip = flip_dist(rng_);
         }
 
-        // Color jitter factors (train only): brightness, contrast, saturation
+        // Color jitter factors (train only): brightness, contrast, saturation,
+        // each scaled 0.7-1.3x
         float bf = 1.0f, cf = 1.0f, sf = 1.0f;
         if (train_mode_) {
-            std::uniform_real_distribution<float> b_dist(0.8f, 1.2f);
-            std::uniform_real_distribution<float> c_dist(0.8f, 1.2f);
-            std::uniform_real_distribution<float> s_dist(0.8f, 1.2f);
+            std::uniform_real_distribution<float> b_dist(0.7f, 1.3f);
+            std::uniform_real_distribution<float> c_dist(0.7f, 1.3f);
+            std::uniform_real_distribution<float> s_dist(0.7f, 1.3f);
             bf = b_dist(rng_); cf = c_dist(rng_); sf = s_dist(rng_);
         }
 
@@ -296,8 +297,8 @@ public:
         if (train_mode_) {
             std::bernoulli_distribution erase_dist(0.5);
             if (erase_dist(rng_)) {
-                // Random rectangle, area 2-15% of image, aspect 0.3-3.3, filled with 0.
-                std::uniform_real_distribution<float> area_dist(0.02f, 0.15f);
+                // Random rectangle, area 4-20% of image, aspect 0.3-3.3, filled with 0.
+                std::uniform_real_distribution<float> area_dist(0.04f, 0.20f);
                 std::uniform_real_distribution<float> aspect_dist(0.3f, 3.3f);
                 float area = area_dist(rng_) * (target_height_ * target_width_);
                 float aspect = aspect_dist(rng_);
@@ -418,140 +419,211 @@ public:
 };
 
 // ============================================================================
-// ResNet10: conv1 -> bn1 -> relu -> maxpool -> 
-//           layer1 (2 blocks) -> layer2 (2 blocks) -> layer3 (2 blocks) ->
-//           avgpool -> fc
+// Bottleneck for ResNet50: 1x1 -> BN -> ReLU -> 3x3 (stride) -> BN -> ReLU
+// -> 1x1 -> BN -> (skip add) -> ReLU. Out channels = 4 * mid_channels.
 // ============================================================================
 
 template<typename T>
-class ResNet10 : public Module<T> {
+class Bottleneck : public Module<T> {
 public:
-    const char* name() const override { return "ResNet10"; }
-    
+    const char* name() const override { return "Bottleneck"; }
+
+    Conv2D<T> conv1_;  // 1x1: in -> mid
+    Conv2D<T> conv2_;  // 3x3: mid -> mid (stride, pad 1)
+    Conv2D<T> conv3_;  // 1x1: mid -> 4*mid
+    BatchNorm2d<T> bn1_;
+    BatchNorm2d<T> bn2_;
+    BatchNorm2d<T> bn3_;
+    bool downsample_;
+    Conv2D<T> downsample_conv_;
+    BatchNorm2d<T> downsample_bn_;
+
+    Bottleneck(int in_channels, int mid_channels, int stride = 1, Device device = {})
+        : conv1_(in_channels, mid_channels, 1, 1, 0, true, device),
+          conv2_(mid_channels, mid_channels, 3, stride, 1, true, device),
+          conv3_(mid_channels, mid_channels * 4, 1, 1, 0, true, device),
+          bn1_(mid_channels, T(1e-5), T(0.1), device),
+          bn2_(mid_channels, T(1e-5), T(0.1), device),
+          bn3_(mid_channels * 4, T(1e-5), T(0.1), device),
+          downsample_(stride != 1 || in_channels != mid_channels * 4),
+          downsample_conv_(in_channels, mid_channels * 4, 1, stride, 0, true, device),
+          downsample_bn_(mid_channels * 4, T(1e-5), T(0.1), device)
+    {
+    }
+
+    Tensor<T> forward(const Tensor<T>& x) override {
+        auto identity = x;
+
+        auto out = conv1_.forward(x);
+        out = bn1_.forward_relu(out);
+
+        out = conv2_.forward(out);
+        out = bn2_.forward_relu(out);
+
+        out = conv3_.forward(out);
+        out = bn3_.forward(out);
+
+        if (downsample_) {
+            identity = downsample_conv_.forward(identity);
+            identity = downsample_bn_.forward(identity);
+        }
+
+        out = out + identity;  // Skip connection
+        out = relu(out);
+
+        return out;
+    }
+
+    std::vector<Tensor<T>> parameters() const override {
+        auto params = conv1_.parameters();
+        auto p = conv2_.parameters();
+        params.insert(params.end(), p.begin(), p.end());
+        p = conv3_.parameters();
+        params.insert(params.end(), p.begin(), p.end());
+        p = bn1_.parameters();
+        params.insert(params.end(), p.begin(), p.end());
+        p = bn2_.parameters();
+        params.insert(params.end(), p.begin(), p.end());
+        p = bn3_.parameters();
+        params.insert(params.end(), p.begin(), p.end());
+        if (downsample_) {
+            p = downsample_conv_.parameters();
+            params.insert(params.end(), p.begin(), p.end());
+            p = downsample_bn_.parameters();
+            params.insert(params.end(), p.begin(), p.end());
+        }
+        return params;
+    }
+
+    void to(Device device) override {
+        conv1_.to(device);
+        conv2_.to(device);
+        conv3_.to(device);
+        bn1_.to(device);
+        bn2_.to(device);
+        bn3_.to(device);
+        if (downsample_) {
+            downsample_conv_.to(device);
+            downsample_bn_.to(device);
+        }
+    }
+
+    void train() {
+        this->is_training_ = true;
+        bn1_.train();
+        bn2_.train();
+        bn3_.train();
+        if (downsample_) downsample_bn_.train();
+    }
+
+    void eval() {
+        this->is_training_ = false;
+        bn1_.eval();
+        bn2_.eval();
+        bn3_.eval();
+        if (downsample_) downsample_bn_.eval();
+    }
+};
+
+// ============================================================================
+// ResNet50 (adapted to 84x84): stem -> [3,4,6,3] bottleneck stages
+// 84 -> conv7x7 s2 -> 42 -> maxpool -> 21 -> avgpool -> 3x3 -> fc(2048)
+// Stage widths (in/out): 64->256, 256->512, 512->1024, 1024->2048.
+// Stages are std::vector<std::shared_ptr<Bottleneck<T>>> (ResNet10's manual
+// member-per-block pattern would need 16 blocks; a vector keeps wiring sane).
+// ============================================================================
+
+template<typename T>
+class ResNet50 : public Module<T> {
+public:
+    const char* name() const override { return "ResNet50"; }
+
     Conv2D<T> conv1_;
     BatchNorm2d<T> bn1_;
     MaxPool2D<T> maxpool_;
-    
-    BasicBlock<T> layer1_block1_;
-    BasicBlock<T> layer1_block2_;
-    BasicBlock<T> layer2_block1_;
-    BasicBlock<T> layer2_block2_;
-    BasicBlock<T> layer3_block1_;
-    BasicBlock<T> layer3_block2_;
-    
-    size_t fc_in_features_;
-    Linear<T> fc_;
+    std::vector<std::shared_ptr<Bottleneck<T>>> stage1_, stage2_, stage3_, stage4_;
     AdaptiveAvgPool2D<T> avg_pool_;
     Dropout<T> dropout_{T(0.5)};
-    
-    ResNet10(int num_classes = 100, Device device = {})
-        : conv1_(3, 64, 7, 2, 3, true, device),  // 84x84 -> 42x42
+    Linear<T> fc_;
+
+    ResNet50(int num_classes = 100, Device device = {})
+        : conv1_(3, 64, 7, 2, 3, true, device),   // 84x84 -> 42x42
           bn1_(64, T(1e-5), T(0.1), device),
-          maxpool_(3, 2, 1),                      // 42x42 -> 21x21
-          layer1_block1_(64, 64, 1, device),
-          layer1_block2_(64, 64, 1, device),
-          layer2_block1_(64, 128, 2, device),     // 21x21 -> 11x11
-          layer2_block2_(128, 128, 1, device),
-          layer3_block1_(128, 256, 2, device),    // 11x11 -> 6x6
-          layer3_block2_(256, 256, 1, device),
-          fc_in_features_(256),
-          fc_(fc_in_features_, num_classes, device),
-          avg_pool_(1)
+          maxpool_(3, 2, 1),                       // 42x42 -> 21x21
+          avg_pool_(1),
+          fc_(2048, num_classes, device)
     {
+        // Stage 1: 3 blocks, 64 -> 256, @21x21.
+        // NOTE: non-first blocks take the PREVIOUS block's output width
+        // (4 * mid_channels) as conv1_ input — standard ResNet convention.
+        stage1_.push_back(std::make_shared<Bottleneck<T>>(64, 64, 1, device));
+        for (int i = 1; i < 3; ++i)
+            stage1_.push_back(std::make_shared<Bottleneck<T>>(256, 64, 1, device));
+        // Stage 2: 4 blocks, 256 -> 512, first stride 2 (21x21 -> 11x11)
+        stage2_.push_back(std::make_shared<Bottleneck<T>>(256, 128, 2, device));
+        for (int i = 1; i < 4; ++i)
+            stage2_.push_back(std::make_shared<Bottleneck<T>>(512, 128, 1, device));
+        // Stage 3: 6 blocks, 512 -> 1024, first stride 2 (11x11 -> 6x6)
+        stage3_.push_back(std::make_shared<Bottleneck<T>>(512, 256, 2, device));
+        for (int i = 1; i < 6; ++i)
+            stage3_.push_back(std::make_shared<Bottleneck<T>>(1024, 256, 1, device));
+        // Stage 4: 3 blocks, 1024 -> 2048, first stride 2 (6x6 -> 3x3)
+        stage4_.push_back(std::make_shared<Bottleneck<T>>(1024, 512, 2, device));
+        for (int i = 1; i < 3; ++i)
+            stage4_.push_back(std::make_shared<Bottleneck<T>>(2048, 512, 1, device));
     }
-    
+
     Tensor<T> forward(const Tensor<T>& x) override {
-        // Initial conv: 84x84 -> 42x42
         auto out = conv1_.forward(x);
         out = bn1_.forward_relu(out);
-        
-        // MaxPool: 42x42 -> 21x21
         out = maxpool_.forward(out);
-        
-        // Layer 1: 21x21 -> 21x21
-        out = layer1_block1_.forward(out);
-        out = layer1_block2_.forward(out);
-        
-        // Layer 2: 21x21 -> 11x11
-        out = layer2_block1_.forward(out);
-        out = layer2_block2_.forward(out);
-        
-        // Layer 3: 11x11 -> 6x6
-        out = layer3_block1_.forward(out);
-        out = layer3_block2_.forward(out);
-        
-        // Global average pooling: [N, 256, 6, 6] -> [N, 256, 1, 1]
+        for (auto& b : stage1_) out = b->forward(out);
+        for (auto& b : stage2_) out = b->forward(out);
+        for (auto& b : stage3_) out = b->forward(out);
+        for (auto& b : stage4_) out = b->forward(out);
         out = avg_pool_.forward(out);
-        
-        // Flatten: [N, 256, 1, 1] -> [N, 256]
         out = flatten(out);
-        
-        // Dropout on the 256-dim features before the FC head (p=0.5, train only)
         out = dropout_.forward(out);
-        
-        // FC: [N, 256] -> [N, num_classes]
         out = fc_.forward(out);
-        
         return out;
     }
-    
+
     std::vector<Tensor<T>> parameters() const override {
         auto params = conv1_.parameters();
         auto p = bn1_.parameters();
         params.insert(params.end(), p.begin(), p.end());
-        
-        auto p1 = layer1_block1_.parameters();
-        params.insert(params.end(), p1.begin(), p1.end());
-        auto p2 = layer1_block2_.parameters();
-        params.insert(params.end(), p2.begin(), p2.end());
-        auto p3 = layer2_block1_.parameters();
-        params.insert(params.end(), p3.begin(), p3.end());
-        auto p4 = layer2_block2_.parameters();
-        params.insert(params.end(), p4.begin(), p4.end());
-        auto p5 = layer3_block1_.parameters();
-        params.insert(params.end(), p5.begin(), p5.end());
-        auto p6 = layer3_block2_.parameters();
-        params.insert(params.end(), p6.begin(), p6.end());
-        
+        for (const auto& stage : {&stage1_, &stage2_, &stage3_, &stage4_}) {
+            for (const auto& b : *stage) {
+                auto bp = b->parameters();
+                params.insert(params.end(), bp.begin(), bp.end());
+            }
+        }
         auto pfc = fc_.parameters();
         params.insert(params.end(), pfc.begin(), pfc.end());
-        
         return params;
     }
-    
+
     void to(Device device) override {
         conv1_.to(device);
         bn1_.to(device);
-        layer1_block1_.to(device);
-        layer1_block2_.to(device);
-        layer2_block1_.to(device);
-        layer2_block2_.to(device);
-        layer3_block1_.to(device);
-        layer3_block2_.to(device);
+        for (auto& stage : {&stage1_, &stage2_, &stage3_, &stage4_})
+            for (auto& b : *stage) b->to(device);
         fc_.to(device);
     }
-    
+
     void train() {
         this->is_training_ = true;
         bn1_.train();
-        layer1_block1_.train();
-        layer1_block2_.train();
-        layer2_block1_.train();
-        layer2_block2_.train();
-        layer3_block1_.train();
-        layer3_block2_.train();
+        for (auto& stage : {&stage1_, &stage2_, &stage3_, &stage4_})
+            for (auto& b : *stage) b->train();
         dropout_.train();
     }
-    
+
     void eval() {
         this->is_training_ = false;
         bn1_.eval();
-        layer1_block1_.eval();
-        layer1_block2_.eval();
-        layer2_block1_.eval();
-        layer2_block2_.eval();
-        layer3_block1_.eval();
-        layer3_block2_.eval();
+        for (auto& stage : {&stage1_, &stage2_, &stage3_, &stage4_})
+            for (auto& b : *stage) b->eval();
         dropout_.eval();
     }
 };
@@ -603,8 +675,8 @@ extern "C" void handle_signal(int) {
     g_interrupted = 1;
 }
 
-const std::string CHECKPOINT_PATH = "resnet10_checkpoint.bin";
-const std::string CHECKPOINT_META_PATH = "resnet10_checkpoint_meta.bin";
+const std::string CHECKPOINT_PATH = "resnet50_checkpoint.bin";
+const std::string CHECKPOINT_META_PATH = "resnet50_checkpoint_meta.bin";
 
 template<typename T>
 void save_checkpoint_meta(const std::string& path, int epoch, T best_val_acc) {
@@ -639,7 +711,7 @@ void export_onnx(const std::string& path, Module<T>& model, const std::vector<si
     f << "model_version: 1\n\n";
     
     f << "graph {\n";
-    f << "  name: \"resnet10\"\n\n";
+    f << "  name: \"resnet50\"\n\n";
     
     // Input
     f << "  input {\n";
@@ -759,7 +831,7 @@ int main() {
     
     using T = float;
     
-    std::cout << "=== ResNet10 Training on miniImageNet ===" << std::endl;
+    std::cout << "=== ResNet50 Training on miniImageNet ===" << std::endl;
     
     // Load dataset
     fmt::print("\n[1] Loading miniImageNet dataset...\n");
@@ -776,15 +848,17 @@ int main() {
     
     // Create data loaders
     const size_t batch_size = 128;
-    DataLoader<T> train_loader(*train_ds, batch_size, true);
+    // AsyncDataLoader: prefetch thread decodes/collates 2 batches ahead while
+    // the GPU trains. Restart-safe across epochs (see AsyncDataLoader::begin).
+    AsyncDataLoader<T> train_loader(*train_ds, batch_size, true, 2);
     DataLoader<T> val_loader(*val_ds, batch_size, false);
     
     fmt::print("Train batches: {}\n", (train_ds->size() + batch_size - 1) / batch_size);
     fmt::print("Val batches: {}\n", (val_ds->size() + batch_size - 1) / batch_size);
 
     // Create model
-    fmt::print("\n[2] Creating ResNet10 model...\n");
-    auto model = std::make_shared<ResNet10<T>>(num_classes);
+    fmt::print("\n[2] Creating ResNet50 model...\n");
+    auto model = std::make_shared<ResNet50<T>>(num_classes);
     
     Device gpu(DeviceType::CUDA);
     model->to(gpu);
@@ -800,21 +874,21 @@ int main() {
     // Optimizer — SGD with momentum and weight decay.
     // base_lr 0.01 (stable after warmup; diagnosed earlier that LR > 0.015 diverges).
     // Gradient clipping at 10.0 catches rare spikes (steady-state grad norm ~1-10).
-    // weight_decay 1e-3 (up from 5e-4) + Dropout(0.5) on the 256-dim features before
-    // the FC head, because the model (2.81M params, 54K train images) overfits hard:
-    // previous run reached train_loss ~0.01 vs val_loss ~1.6 with val acc plateauing ~60%.
+    // 300 epochs for ResNet50 (25.6M params — much higher overfit risk than ResNet10's
+    // 2.81M), so the regularization stack is stronger: label smoothing 0.1 on the train
+    // loss (val loss unsmoothed), stronger augmentation (pad 12, jitter 0.7-1.3,
+    // erase 4-20%), weight decay 1e-3, dropout 0.5 on the 2048-dim features.
     //
     // NOTE: this run is deliberately EAGER (no graph capture) — see the loop comment
     // below. Dropout's CPU-side mask (std::mt19937 in Dropout::forward) would be baked
     // into a captured graph and replayed with a FIXED mask every batch, which is wrong;
-    // a graph-safe Dropout needs a GPU-side RNG kernel (library change).
+    // a graph-safe Dropout needs a GPU-side RNG kernel (library change). BatchNorm
+    // running stats ARE graph-safe (device kernels folded outside the captured graph,
+    // see BatchNorm2d::fold_running_stats in Module.hpp).
     //
-    // 400 epochs total (down from 1000): the previous run gained almost nothing from
-    // epochs 30-500 at lr ~0.01 (val loss stuck ~1.9-2.1 while train loss fell to 0.1)
-    // and only improved once cosine decayed LR below ~0.005. 20-epoch warmup, then
-    // cosine from 0.01 to 1e-5 over the remaining 380 epochs.
+    // 20-epoch linear warmup, then cosine from 0.01 to 1e-5 over the remaining 280 epochs.
     const T base_lr = T(0.01);
-    const int epochs = 400;
+    const int epochs = 300;
     const int warmup_epochs = 20;
     SGD<T> optimizer(model->parameters(), base_lr, T(0.001), 0.9, T(10.0));
     // AdamW<T> optimizer(model->parameters(), T(0.001), T(0.9), T(0.999), T(1e-8), T(0.01));
@@ -824,7 +898,7 @@ int main() {
     CosineAnnealingLR<T> scheduler(optimizer, epochs - warmup_epochs, T(1e-5));
     
     T best_val_acc = T(0);
-    std::string best_weights_path = "best_resnet10.bin";
+    std::string best_weights_path = "best_resnet50.bin";
     int start_epoch = 0;
     
     // Install signal handlers
@@ -912,7 +986,7 @@ int main() {
             model->train();
             optimizer.zero_grad();
             auto preds = model->forward(bx_gpu);
-            auto loss = cross_entropy(preds, by_gpu);
+            auto loss = cross_entropy(preds, by_gpu, T(0.1));  // Label smoothing 0.1 (train only)
             loss.backward();
             optimizer.step();
 
@@ -998,15 +1072,15 @@ int main() {
     
     // Save final model
     fmt::print("\n[5] Saving model...\n");
-    model->save("resnet10_final.bin");
-    fmt::print("Saved final weights to resnet10_final.bin\n");
+    model->save("resnet50_final.bin");
+    fmt::print("Saved final weights to resnet50_final.bin\n");
     
     // Export graph structure
-    model->export_onnx("resnet10.graph");
-    fmt::print("Saved graph structure to resnet10.graph\n");
+    model->export_onnx("resnet50.graph");
+    fmt::print("Saved graph structure to resnet50.graph\n");
 
     // Export ONNX (simplified format)
-    export_onnx("resnet10.onnx.txt", *model, {1, 3, 84, 84});
+    export_onnx("resnet50.onnx.txt", *model, {1, 3, 84, 84});
     
     fmt::print("\n=== Training Complete ===\n");
     

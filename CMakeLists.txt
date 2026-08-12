@@ -69,8 +69,8 @@ add_executable(tensor_tests
     # test/dataset_test.cpp
     # test/mnist.cpp
     # test/scheduler_test.cpp
-    # test/benchmark.cpp
-    test/resnet.cpp
+    test/benchmark.cpp
+    # test/resnet.cpp
 )
 target_include_directories(tensor_tests PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 

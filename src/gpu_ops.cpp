@@ -868,12 +868,14 @@ __global__ void fused_backward_input_kernel(
     T* __restrict__ grad_input,
     int N, int C_in, int C_out, int H, int W,
     int kH, int kW, int pad, int stride,
-    int H_out, int W_out
+    int H_out, int W_out,
+    int z_base
 ) {
     int w = blockIdx.x * blockDim.x + threadIdx.x;
     int h = blockIdx.y * blockDim.y + threadIdx.y;
-    int c = blockIdx.z % C_in;
-    int n = blockIdx.z / C_in;
+    int idx = z_base + blockIdx.z;
+    int c = idx % C_in;
+    int n = idx / C_in;
 
     if (h >= H || w >= W) return;
 
@@ -1752,13 +1754,17 @@ __global__ void im2col_kernel(
     T* __restrict__ data_col,
     int N, int C, int H, int W,
     int kH, int kW, int pad, int stride,
-    int H_out, int W_out
+    int H_out, int W_out,
+    int z_base
 ) {
     int w_out_base = (blockIdx.x * blockDim.x + threadIdx.x) * 4;
     int h_out = blockIdx.y * blockDim.y + threadIdx.y;
 
-    int c_in = blockIdx.z % C;
-    int n    = blockIdx.z / C;
+    // z_base: chunked z-offset (grid.z is capped at 65535 on CUDA, but
+    // N*C can exceed it for wide layers at large batch).
+    int idx = z_base + blockIdx.z;
+    int c_in = idx % C;
+    int n    = idx / C;
 
     int in_tile_w = (blockDim.x * 4 - 1) * stride + kW;
     int in_tile_h = (blockDim.y - 1) * stride + kH;
@@ -1985,11 +1991,13 @@ __global__ void winograd_input_kernel(
     T* __restrict__ v,         // [N, tiles_h, tiles_w, C_in, 4, 4]
     int N, int C_in, int H, int W,
     int tiles_h, int tiles_w,
-    int pad)
-{
+    int pad,
+    int z_base
+) {
     int tw = blockIdx.x, th = blockIdx.y;
-    int cin = blockIdx.z % C_in;
-    int n   = blockIdx.z / C_in;
+    int idx = z_base + blockIdx.z;
+    int cin = idx % C_in;
+    int n   = idx / C_in;
     int tid = threadIdx.x; // 0..15 for 4x4
 
     // Extract 4x4 tile from input (overlapping, stride 2 in tile space)
@@ -2066,11 +2074,13 @@ __global__ void winograd_forward_kernel(
     T* __restrict__ y,          // [N, C_out, H_out, W_out]
     int N, int C_in, int C_out,
     int tiles_h, int tiles_w,
-    int H_out, int W_out)
-{
+    int H_out, int W_out,
+    int z_base
+) {
     int tw = blockIdx.x, th = blockIdx.y;
-    int cout = blockIdx.z % C_out;
-    int n    = blockIdx.z / C_out;
+    int idx = z_base + blockIdx.z;
+    int cout = idx % C_out;
+    int n    = idx / C_out;
     int tid = threadIdx.x; // 0..15
 
     if (tw >= tiles_w || th >= tiles_h) return;
@@ -2176,25 +2186,37 @@ bool conv2d_winograd_gpu(
     size_t v_size = N * tiles_h * tiles_w * C_in * 16;
     T* v_buf = static_cast<T*>(MemoryPool::get().allocate(v_size * sizeof(T), Device{DeviceType::CUDA}));
 
-    // Transform input tiles
+    // Transform input tiles (grid.z = N*C_in chunked: can exceed CUDA's
+    // 65535 z-limit for wide layers at large batch)
     {
         dim3 inp_block(16);
-        dim3 inp_grid((uint32_t)tiles_w, (uint32_t)tiles_h, (uint32_t)(N * C_in));
-        winograd_input_kernel<T><<<inp_grid, inp_block, 0, active_stream()>>>(
-            input.data(), v_buf,
-            (int)N, (int)C_in, (int)H, (int)W,
-            tiles_h, tiles_w, 1);
+        size_t total_z = N * C_in;
+        for (size_t z0 = 0; z0 < total_z; z0 += 65535) {
+            size_t z_rem = total_z - z0;
+            uint32_t z = (uint32_t)(z_rem > 65535 ? 65535 : z_rem);
+            dim3 inp_grid((uint32_t)tiles_w, (uint32_t)tiles_h, z);
+            winograd_input_kernel<T><<<inp_grid, inp_block, 0, active_stream()>>>(
+                input.data(), v_buf,
+                (int)N, (int)C_in, (int)H, (int)W,
+                tiles_h, tiles_w, 1, (int)z0);
+        }
         GPU_CHECK(get_last_error_capture_safe());
     }
 
-    // Fused multiply-accumulate + output transform
+    // Fused multiply-accumulate + output transform (grid.z = N*C_out
+    // chunked for CUDA's 65535 z-limit, same as the input transform)
     {
         dim3 fwd_block(16);
-        dim3 fwd_grid((uint32_t)tiles_w, (uint32_t)tiles_h, (uint32_t)(N * C_out));
-        winograd_forward_kernel<T><<<fwd_grid, fwd_block, 0, active_stream()>>>(
-            u_buf, v_buf, output.data(),
-            (int)N, (int)C_in, (int)C_out,
-            tiles_h, tiles_w, (int)H_out, (int)W_out);
+        size_t total_z = N * C_out;
+        for (size_t z0 = 0; z0 < total_z; z0 += 65535) {
+            size_t z_rem = total_z - z0;
+            uint32_t z = (uint32_t)(z_rem > 65535 ? 65535 : z_rem);
+            dim3 fwd_grid((uint32_t)tiles_w, (uint32_t)tiles_h, z);
+            winograd_forward_kernel<T><<<fwd_grid, fwd_block, 0, active_stream()>>>(
+                u_buf, v_buf, output.data(),
+                (int)N, (int)C_in, (int)C_out,
+                tiles_h, tiles_w, (int)H_out, (int)W_out, (int)z0);
+        }
         GPU_CHECK(get_last_error_capture_safe());
     }
 
@@ -2239,14 +2261,22 @@ void conv2d_gpu(
     d_data_col = static_cast<T*>(MemoryPool::get().allocate(col_size, Device{DeviceType::CUDA}));
 
     dim3 threads(16, 16);
-    dim3 blocks((W_out + threads.x * 4 - 1) / (threads.x * 4), 
-                (H_out + threads.y - 1) / threads.y, 
-                N * C_in);
     size_t smem_size = ((threads.y - 1) * stride + kH) * ((threads.x * 4 - 1) * stride + kW) * sizeof(T);
-    
-    im2col_kernel<T><<<blocks, threads, smem_size, active_stream()>>>(
-        input.data(), d_data_col, N, C_in, H, W, kH, kW, padding, stride, H_out, W_out
-    );
+
+    // grid.z = N * C_in can exceed CUDA's 65535 limit (e.g. batch 128 with
+    // C_in >= 512); chunk the z-dimension into <=65535 slices with a base
+    // offset so the kernel indexes the same (n, c_in) pairs.
+    size_t total_z = N * C_in;
+    for (size_t z0 = 0; z0 < total_z; z0 += 65535) {
+        size_t z_rem = total_z - z0;
+        uint32_t z = (uint32_t)(z_rem > 65535 ? 65535 : z_rem);
+        dim3 blocks((W_out + threads.x * 4 - 1) / (threads.x * 4), 
+                    (H_out + threads.y - 1) / threads.y, 
+                    z);
+        im2col_kernel<T><<<blocks, threads, smem_size, active_stream()>>>(
+            input.data(), d_data_col, N, C_in, H, W, kH, kW, padding, stride, H_out, W_out, (int)z0
+        );
+    }
 
 #if defined(USE_CUDA)
     GPU_CHECK(get_last_error_capture_safe());
@@ -2490,14 +2520,20 @@ void conv2d_backward_input_gpu(const Tensor<T>& grad_output, const Tensor<T>& we
     GPU_CHECK(get_last_error_capture_safe());
 #endif
 
-    // Fused backward: single kernel does W^T x dY GEMM + col2im in one pass
+    // Fused backward: single kernel does W^T x dY GEMM + col2im in one pass.
+    // grid.z = N * C_in chunked for CUDA's 65535 z-limit (same as im2col).
     {
         dim3 fwd_threads(16, 16);
-        dim3 fwd_blocks((W + 15) / 16, (H + 15) / 16, N * C_in);
-        fused_backward_input_kernel<T><<<fwd_blocks, fwd_threads, 0, active_stream()>>>(
-            grad_output.data(), d_weight_T, grad_input.data(),
-            N, C_in, C_out, H, W, kH, kW, (int)padding, (int)stride, H_out, W_out
-        );
+        size_t total_z = N * C_in;
+        for (size_t z0 = 0; z0 < total_z; z0 += 65535) {
+            size_t z_rem = total_z - z0;
+            uint32_t z = (uint32_t)(z_rem > 65535 ? 65535 : z_rem);
+            dim3 fwd_blocks((W + 15) / 16, (H + 15) / 16, z);
+            fused_backward_input_kernel<T><<<fwd_blocks, fwd_threads, 0, active_stream()>>>(
+                grad_output.data(), d_weight_T, grad_input.data(),
+                N, C_in, C_out, H, W, kH, kW, (int)padding, (int)stride, H_out, W_out, (int)z0
+            );
+        }
     }
 
 #if defined(USE_CUDA)
@@ -2945,7 +2981,7 @@ void copy_gpu_strided(const Tensor<T> src, T* dst) {
 template<typename T>
 __global__ void cross_entropy_fwd_kernel(
     const T* logits, const T* targets, T* per_batch_loss,
-    int B, int C
+    int B, int C, T smoothing
 ) {
     int bid = blockIdx.x;
     if (bid >= B) return;
@@ -2982,12 +3018,15 @@ __global__ void cross_entropy_fwd_kernel(
     T total_exp = shared[0];
     __syncthreads();
 
-    T loss = 0;
+    T sm_uniform = smoothing / T(C);
+    T loss = 0, sum_logp = 0;
     for (int i = threadIdx.x; i < C; i += blockDim.x) {
         T p = exp(l[i] - batch_max) / total_exp;
-        loss += t[i] * log(fmax(p, 1e-30f));
+        T lp = log(fmax(p, 1e-30f));
+        loss += t[i] * lp;
+        sum_logp += lp;
     }
-    shared[threadIdx.x] = -loss;
+    shared[threadIdx.x] = -((T(1) - smoothing) * loss + sm_uniform * sum_logp);
     for (int s = blockDim.x / 2; s > 0; s >>= 1) {
         __syncthreads();
         if (threadIdx.x < s)
@@ -3065,7 +3104,7 @@ template<typename T>
 __global__ void cross_entropy_bwd_kernel(
     const T* logits, const T* targets, const T* grad_output,
     T* grad_logits,
-    int B, int C
+    int B, int C, T smoothing
 ) {
     int bid = blockIdx.x;
     if (bid >= B) return;
@@ -3107,14 +3146,16 @@ __global__ void cross_entropy_bwd_kernel(
 
     // 3. Compute gradients for the elements owned by this thread
     T go_scale = grad_output[0] / T(B);
+    T sm_uniform = smoothing / T(C);
     for (int i = threadIdx.x; i < C; i += blockDim.x) {
         T p = exp(l[i] - batch_max) / total_exp;
-        gl[i] = (p - t[i]) * go_scale;
+        T sm = (T(1) - smoothing) * t[i] + sm_uniform;
+        gl[i] = (p - sm) * go_scale;
     }
 }
 
 template<typename T>
-Tensor<T> cross_entropy_fwd_gpu(const Tensor<T>& logits, const Tensor<T>& targets) {
+Tensor<T> cross_entropy_fwd_gpu(const Tensor<T>& logits, const Tensor<T>& targets, T smoothing) {
     int B = logits.shape()[0];
     int C = logits.shape()[1];
 
@@ -3136,7 +3177,7 @@ Tensor<T> cross_entropy_fwd_gpu(const Tensor<T>& logits, const Tensor<T>& target
         return result;
     }
     cross_entropy_fwd_kernel<T><<<B, threads, smem, active_stream()>>>(
-        logits.data(), targets.data(), per_batch_loss.data(), B, C
+        logits.data(), targets.data(), per_batch_loss.data(), B, C, smoothing
     );
 
     // Second kernel: reduce per-batch losses to scalar mean
@@ -3161,7 +3202,7 @@ Tensor<T> cross_entropy_fwd_gpu(const Tensor<T>& logits, const Tensor<T>& target
 template<typename T>
 void cross_entropy_bwd_gpu(
     const Tensor<T>& grad_output, const Tensor<T>& logits,
-    const Tensor<T>& targets, Tensor<T>& grad_logits
+    const Tensor<T>& targets, Tensor<T>& grad_logits, T smoothing
 ) {
     int B = logits.shape()[0];
     int C = logits.shape()[1];
@@ -3177,7 +3218,7 @@ void cross_entropy_bwd_gpu(
 
     cross_entropy_bwd_kernel<T><<<B, threads, smem, active_stream()>>>(
         logits.data(), targets.data(), grad_output.data(),
-        grad_logits.data(), B, C
+        grad_logits.data(), B, C, smoothing
     );
 
 #if defined(USE_CUDA)
@@ -3595,8 +3636,8 @@ template void conv2d_backward_bias_gpu<float>(Tensor<float> const&, Tensor<float
 template void max_pool2d_backward_gpu<float>(Tensor<float> const&, Tensor<float>&, Tensor<size_t> const&);
 template void copy_gpu_strided<float>(const Tensor<float> src, float* dst);
 
-template Tensor<float> cross_entropy_fwd_gpu<float>(const Tensor<float>&, const Tensor<float>&);
-template void cross_entropy_bwd_gpu<float>(const Tensor<float>&, const Tensor<float>&, const Tensor<float>&, Tensor<float>&);
+template Tensor<float> cross_entropy_fwd_gpu<float>(const Tensor<float>&, const Tensor<float>&, float);
+template void cross_entropy_bwd_gpu<float>(const Tensor<float>&, const Tensor<float>&, const Tensor<float>&, Tensor<float>&, float);
 template void adam_step_gpu<float>(Tensor<float>&, const Tensor<float>&, Tensor<float>&, Tensor<float>&, float, float, float, float, float, float, float);
 template void adamw_step_gpu<float>(Tensor<float>&, const Tensor<float>&, Tensor<float>&, Tensor<float>&, float, float, float, float, float, float, float);
 template Tensor<float> softmax_gpu<float>(const Tensor<float>&);

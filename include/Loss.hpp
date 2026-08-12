@@ -32,26 +32,34 @@ Tensor<T> mse_loss(const Tensor<T>& preds, const Tensor<T>& targets) {
 // Expected shapes: [batch_size, num_classes] for both.
 // ---------------------------------------------------------
 template<typename T>
-Tensor<T> cross_entropy(const Tensor<T>& logits, const Tensor<T>& targets) {
+Tensor<T> cross_entropy(const Tensor<T>& logits, const Tensor<T>& targets, T smoothing = T(0)) {
     if (logits.shape() != targets.shape()) {
         throw std::invalid_argument("Cross-entropy requires logits and targets to have the same shape.");
     }
 
     if (logits.device().type != DeviceType::CPU) {
         // GPU: fused forward + backward via CrossEntropyBackward node
-        Tensor<T> loss = cross_entropy_fwd_gpu(logits, targets);
+        Tensor<T> loss = cross_entropy_fwd_gpu(logits, targets, smoothing);
         if (GradMode::is_enabled() && logits.requires_grad()) {
             loss.set_requires_grad(true);
-            loss.set_grad_fn(std::make_shared<CrossEntropyBackward<T>>(logits, targets));
+            loss.set_grad_fn(std::make_shared<CrossEntropyBackward<T>>(logits, targets, smoothing));
         }
         return loss;
+    }
+
+    // Smoothed one-hot targets: (1-s)*y + s/C
+    Tensor<T> sm_targets = targets * (T(1) - smoothing);
+    if (smoothing > T(0)) {
+        Tensor<T> uniform(targets.shape());
+        uniform.fill(T(smoothing) / T(targets.shape()[1]));
+        sm_targets = sm_targets + uniform;
     }
 
     Tensor<T> exp_l = exp(logits);
     Tensor<T> sum_exp = sum(exp_l, 1, true);
     Tensor<T> probs = exp_l / sum_exp;
     Tensor<T> log_probs = log(probs);
-    Tensor<T> ce_terms = targets * log_probs;
+    Tensor<T> ce_terms = sm_targets * log_probs;
     ce_terms = ce_terms * (T)-1.0;
     Tensor<T> reduced = ce_terms;
     for (int i = reduced.shape().size() - 1; i >= 0; --i) {

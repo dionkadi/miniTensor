@@ -659,9 +659,10 @@ template<typename T>
 struct CrossEntropyBackward : public AutogradNode<T> {
     SavedTensor<T> saved_logits;
     SavedTensor<T> saved_targets;
+    T smoothing_;
 
-    CrossEntropyBackward(Tensor<T> logits, Tensor<T> targets)
-        : saved_logits(logits), saved_targets(targets) {}
+    CrossEntropyBackward(Tensor<T> logits, Tensor<T> targets, T smoothing = T(0))
+        : saved_logits(logits), saved_targets(targets), smoothing_(smoothing) {}
 
     void apply(const Tensor<T>& grad_output) override {
         NoGradGuard guard;
@@ -670,7 +671,7 @@ struct CrossEntropyBackward : public AutogradNode<T> {
 
         if (logits.requires_grad()) {
             Tensor<T> grad_logits(logits.shape(), logits.device());
-            cross_entropy_bwd_gpu(grad_output, logits, targets, grad_logits);
+            cross_entropy_bwd_gpu(grad_output, logits, targets, grad_logits, smoothing_);
             logits.accumulate_grad(grad_logits);
         }
     }
