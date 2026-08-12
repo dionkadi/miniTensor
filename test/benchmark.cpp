@@ -130,7 +130,6 @@ static void bench_unary(const std::string& op_name,
     auto a = make_gpu_tensor(shape);
     auto c = make_gpu_tensor(shape);
     double bytes = 2.0 * N * sizeof(float);   // read a, write c
-    double flops = static_cast<double>(N);
 
     auto r = run_bench("unary/" + op_name,
                        std::to_string(N) + " elems",
@@ -150,7 +149,6 @@ static void bench_binary(const std::string& op_name,
     auto b = make_gpu_tensor(shape);
     auto c = make_gpu_tensor(shape);
     double bytes = 3.0 * N * sizeof(float);   // read a, b; write c
-    double flops = static_cast<double>(N);
 
     auto r = run_bench("binary/" + op_name,
                        std::to_string(N) + " elems",
@@ -296,7 +294,6 @@ static void bench_sum(const std::vector<size_t>& shape, size_t axis) {
     for (auto d : out_shape) out_elems *= d;
 
     double bytes = static_cast<double>(N + out_elems) * sizeof(float); // read N, write out
-    double flops = static_cast<double>(N);
 
     auto r = run_bench("sum(axis=" + std::to_string(axis) + ")",
                        std::to_string(N) + " elems",
@@ -484,7 +481,6 @@ static void bench_bn_relu(int N, int C, int H, int W) {
 static void bench_softmax(int B, int C) {
     auto input = make_gpu_tensor({static_cast<size_t>(B), static_cast<size_t>(C)});
     double bytes = 2.0 * B * C * sizeof(float); // read input, write output
-    double flops = static_cast<double>(B * C * 3); // approx: max, exp+sum, divide
 
     auto r = run_bench("softmax",
                        std::to_string(B) + "x" + std::to_string(C),
@@ -541,7 +537,6 @@ static void bench_add_relu(const std::vector<size_t>& shape) {
     auto c = make_gpu_tensor(shape);
 
     double bytes = 3.0 * N * sizeof(float); // read a,b; write c
-    double flops = static_cast<double>(N);   // add + compare
 
     auto r = run_bench("add_relu",
                        std::to_string(N) + " elems",
@@ -562,7 +557,6 @@ static void bench_adam(const std::vector<size_t>& shape) {
     auto v      = make_gpu_tensor(shape);
 
     double bytes = 4.0 * N * sizeof(float); // read param,grad,m,v; write param,m,v
-    double flops = static_cast<double>(N * 10); // ~10 FLOPs per element
 
     auto r = run_bench("adam_step",
                        std::to_string(N) + " elems",

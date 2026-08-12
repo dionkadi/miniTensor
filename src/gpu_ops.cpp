@@ -2244,13 +2244,18 @@ void conv2d_gpu(
     size_t C_out = weight.shape()[0], kH = weight.shape()[2], kW = weight.shape()[3];
     size_t H_out = output.shape()[2], W_out = output.shape()[3];
 
-    if constexpr (std::is_same_v<T, float>) {
-        if (kH == 3 && kW == 3 && stride == 1 && padding == 1) {
-            bool success = conv2d_winograd_gpu(input, weight, bias, output);
-            GPU_CHECK(get_last_error_capture_safe());
-            if (success) return;
-        }
-    }
+    // Winograd (conv2d_winograd_gpu) is intentionally DISABLED: benchmarks
+    // show it at 0.22-0.33 TFLOPS vs 1.1+ for the im2col+GEMM path below on
+    // the same 3x3 s1 p1 shapes (it re-transforms weights and allocates
+    // buffers on every call). Re-enable only after fixing it to cache the
+    // weight transform and reuse input tiles across channels.
+    // if constexpr (std::is_same_v<T, float>) {
+    //     if (kH == 3 && kW == 3 && stride == 1 && padding == 1) {
+    //         bool success = conv2d_winograd_gpu(input, weight, bias, output);
+    //         GPU_CHECK(get_last_error_capture_safe());
+    //         if (success) return;
+    //     }
+    // }
 
     size_t M = C_out;
     size_t K = C_in * kH * kW;
