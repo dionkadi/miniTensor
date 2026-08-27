@@ -17,6 +17,7 @@ cmake --build build
 - Debug flags: host `-O2 -g`, HIP device `-O3 -g` (HIP at `-O0` is 50-100× slower).
 - CPU-only builds: `GPU_CHECK(call)` expands to nothing, GPU functions return early. No GPU driver needed.
 - VS Code settings force `-DUSE_ROCM=ON`; clangd reads `build/compile_commands.json`.
+- `CMakePresets.json` defines `debug`/`release` presets but they build into `build/debug` / `build/release`, so clangd (which reads `build/`) won't see them — prefer the plain `cmake -B build` flow.
 - `.clangd` adds `--rocm-path=/opt/rocm` and `-D__HIP_PLATFORM_AMD__=1` for clangd in ROCm builds.
 - `include/Kernels.cpp` is **dead code** — commented out in CMakeLists.txt, never compiled.
 - `config.json` at root is OpenCode agent config, not part of the library.
@@ -28,14 +29,14 @@ cmake --build build
 ```
 
 Only one test file is compiled at a time. Edit the commented-out list inside `add_executable(tensor_tests ...)` in CMakeLists.txt to switch:
-- `test/resnet.cpp` — ResNet10 on miniImageNet (currently active, own `main()`)
+- `test/benchmark.cpp` — GPU kernel benchmark suite (own `main()`, currently active)
+- `test/resnet.cpp` — ResNet50 on miniImageNet, Bottleneck blocks + label smoothing (own `main()`)
 - `test/mnist.cpp` — MNIST CNN training (own `main()`)
 - `test/view_test.cpp` — View/autograd tests (own `main()`)
 - `test/engien_test.cpp` — Autograd engine tests (GTest parametrized CPU+GPU via `TEST_P`; note the filename misspelling — that's intentional, not a typo)
 - `test/{tensor,spatial,func,dataset}_test.cpp` — GTest; GPU sections guarded by `#if defined(USE_CUDA) || defined(USE_ROCM)`
 - `test/nn_test.cpp` — standalone (`main()`), manual test of Sequential+SGD
 - `test/scheduler_test.cpp` — Scheduler unit tests (own `main()`)
-- `test/benchmark.cpp` — GPU kernel benchmark suite (own `main()`; on disk, **not** tracked in git)
 - `test/linear_regression_test.cpp` — exists on disk but **not** wired into CMakeLists.txt
 - `test/tensor_test.cpp` and `src/gpu_ops.cpp` get `LANGUAGE` set to CUDA or HIP depending on backend selected.
 - Fixed seed `42` for determinism. Used in He init for `Linear`/`Conv2D` and test random generation.
@@ -55,7 +56,7 @@ docs/          → perf, memory, kernels, features, optimizations, scheduler, et
 
 Key headers beyond `Tensor.hpp` (public API), `TensorImpl.hpp` (storage + view), and `Defines.hpp` (MAX_DIMS, Dtype, DeviceType):
 - `TensorOps.hpp` — CPU kernels + GPU declarations; `safe_out_size()` prevents unsigned wraparound
-- `Autograd.hpp` — 25 backward nodes inheriting `AutogradNode<T>`, `SavedTensor`, `NoGradGuard`
+- `Autograd.hpp` — 26 backward nodes inheriting `AutogradNode<T>`, `SavedTensor`, `NoGradGuard`
 - `Module.hpp` — `Linear`, `Conv2D`, `BatchNorm2d`, `LayerNorm`, `Dropout`, `Sequential`, etc.
 - `Functional.hpp` — `F::relu`, `softmax`, `conv2d`, etc.
 - `Optimizer.hpp` — `SGD`, `Adam`, `AdamW`, plus `GradientScaler` for mixed precision
@@ -79,7 +80,8 @@ Key headers beyond `Tensor.hpp` (public API), `TensorImpl.hpp` (storage + view),
 - Each launcher computes `blocks = (total + threads - 1) / threads` with `int threads = 256`. Some launchers use a vectorized variant `(total + threads*4 - 1) / (threads*4)`. A subset (not all) have `if (blocks == 0) return;` to prevent zero-dim crashes — add this guard when writing new launchers.
 - Template functions explicitly instantiated for `float` only at bottom of file. No other type works on GPU.
 - `active_stream()` thread-local override used in kernel launch wrappers and memcpys for graph capture. Set before capture, `nullptr` otherwise.
-- Fused kernels (do NOT decompose): `cross_entropy_fwd_gpu`/`cross_entropy_bwd_gpu` (softmax+NLLLoss), `adam_step_gpu` (weight decay + moment + bias correction), `bn_relu_fwd_gpu`.
+- Fused kernels (do NOT decompose): `cross_entropy_fwd_gpu`/`cross_entropy_bwd_gpu` (softmax+NLLLoss+label smoothing — both take a `smoothing` param), `adam_step_gpu` (weight decay + moment + bias correction), `bn_relu_fwd_gpu`.
+- `conv2d_winograd_gpu` exists but is **intentionally disabled** (commented out in `conv2d_forward_gpu`): benchmarks show 0.22-0.33 TFLOPS vs 1.1+ for the im2col+GEMM path on 3x3 s1 p1 because it re-transforms weights and allocates buffers per call. Don't re-enable; fix it to cache weight transforms first.
 
 ## Autograd quirks
 
@@ -89,6 +91,7 @@ Key headers beyond `Tensor.hpp` (public API), `TensorImpl.hpp` (storage + view),
 - `SavedTensor` has version counter — throws if tensor mutated in-place since saving.
 - In-place ops (`add_`, `sub_`, `mul_`) bump version counter and reject leaf `requires_grad` tensors.
 - `unbroadcast(grad, original_shape)` applied in backward nodes after binary ops.
+- `BatchNorm2d` has full training-mode backward (`BatchNormBackward` node in Autograd.hpp; gamma/beta are trainable) — not inference-only.
 - `TODO.md` is a completed feature checklist (all items checked, not a plan) — useful reference for library capabilities.
 
 ## Conventions

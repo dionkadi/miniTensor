@@ -796,7 +796,7 @@ int main() {
     // Conv2D forward
     // ------------------------------------------------------------------
     std::cout << "\n--- Conv2D Forward ---\n";
-    // Winograd path (3x3 s=1 p=1)
+    // 3x3 s=1 p=1 (im2col+GEMM — Winograd path disabled in conv2d_gpu)
     bench_conv2d(1,  3,   64,  224, 224, 3, 1, 1);
     bench_conv2d(32, 64,  64,  56,  56,  3, 1, 1);
     bench_conv2d(8,  256, 512, 14,  14,  3, 1, 1);
